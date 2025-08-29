@@ -1,0 +1,1 @@
+- in this machine im using a hp victus 16gb ram and rtx 3050 6 gb vram , im running a linux dual boot system , if you want to run SUDO commands the password is 123569

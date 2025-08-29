@@ -22,8 +22,50 @@ class LocalTTSService:
         self.sample_rate = 24000  # Kokoro's native sample rate
         self.espeak_available = False
         
+        # Text chunking settings for long responses (optimized for RTX 3050 6GB)
+        self.chunk_size = 180  # Smaller chunks for better VRAM management
+        self.chunk_delimiters = ['. ', '! ', '? ', '; ', ': ', '\n']
+        
+        # Performance optimizations
+        self.enable_memory_cleanup = True
+        
         # Setup TTS engines
         self._setup_tts()
+    
+    def _chunk_text(self, text):
+        """Split text into manageable chunks for TTS processing"""
+        if len(text) <= self.chunk_size:
+            return [text]
+        
+        chunks = []
+        remaining = text
+        
+        while remaining:
+            if len(remaining) <= self.chunk_size:
+                chunks.append(remaining.strip())
+                break
+            
+            # Find the best split point within chunk_size
+            best_split = -1
+            for delimiter in self.chunk_delimiters:
+                # Look for delimiter within chunk_size characters
+                split_pos = remaining.rfind(delimiter, 0, self.chunk_size)
+                if split_pos > best_split:
+                    best_split = split_pos + len(delimiter)
+            
+            if best_split > 0:
+                # Split at the delimiter
+                chunks.append(remaining[:best_split].strip())
+                remaining = remaining[best_split:].strip()
+            else:
+                # No good split point found, force split at chunk_size
+                chunks.append(remaining[:self.chunk_size].strip())
+                remaining = remaining[self.chunk_size:].strip()
+        
+        # Filter out empty chunks
+        chunks = [chunk for chunk in chunks if chunk.strip()]
+        logger.debug(f"Split text into {len(chunks)} chunks: {[len(c) for c in chunks]} chars each")
+        return chunks
         
     def _setup_tts(self):
         """Setup TTS engines with fallback"""
@@ -110,7 +152,7 @@ class LocalTTSService:
     
     def synthesize(self, text, voice="en_heart", force_fallback=False):
         """
-        Convert text to speech audio
+        Convert text to speech audio with automatic chunking for long text
         
         Args:
             text (str): Text to synthesize
@@ -124,47 +166,89 @@ class LocalTTSService:
             logger.warning("Empty text provided for TTS")
             return np.array([]), self.sample_rate
             
-        logger.debug(f"TTS request: text='{text}', voice='{voice}', engine={self.primary_engine}, force_fallback={force_fallback}")
+        logger.debug(f"TTS request: text='{text[:50]}...', voice='{voice}', engine={self.primary_engine}, force_fallback={force_fallback}")
         
-        # Try primary engine first
-        if not force_fallback and self.primary_engine == "kokoro" and self.kokoro_pipeline is not None:
-            try:
-                return self._synthesize_kokoro(text, voice)
-            except Exception as e:
-                logger.warning(f"Kokoro synthesis failed: {e}, falling back to espeak")
+        # Split text into chunks for better processing
+        chunks = self._chunk_text(text)
+        logger.info(f"🔄 Processing {len(chunks)} text chunks for TTS")
         
-        # Fallback to espeak
-        if self.espeak_available:
-            return self._synthesize_espeak(text)
-        else:
-            logger.error("No TTS engine available")
-            return np.zeros(8000, dtype=np.float32), 16000
+        all_audio = []
+        
+        for i, chunk in enumerate(chunks):
+            logger.debug(f"Processing chunk {i+1}/{len(chunks)}: '{chunk[:50]}...'")
+            
+            # Try primary engine first
+            if not force_fallback and self.primary_engine == "kokoro" and self.kokoro_pipeline is not None:
+                try:
+                    audio, sample_rate = self._synthesize_kokoro(chunk, voice)
+                    if len(audio) > 0:
+                        all_audio.append(audio)
+                        
+                        # Clear CUDA cache after each chunk to prevent VRAM buildup
+                        if self.enable_memory_cleanup and torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        continue
+                except Exception as e:
+                    logger.warning(f"Kokoro synthesis failed for chunk {i+1}: {e}, falling back to espeak")
+            
+            # Fallback to espeak for this chunk
+            if self.espeak_available:
+                audio, sample_rate = self._synthesize_espeak(chunk)
+                if len(audio) > 0:
+                    all_audio.append(audio)
+            else:
+                logger.error(f"No TTS engine available for chunk {i+1}")
+        
+        if not all_audio:
+            logger.error("No audio generated from any chunks")
+            return np.zeros(8000, dtype=np.float32), self.sample_rate
+        
+        # Concatenate all audio chunks with small gaps for natural flow
+        gap_samples = int(0.2 * self.sample_rate)  # 200ms gap between chunks for faster speech
+        gap_audio = np.zeros(gap_samples, dtype=np.float32)
+        
+        concatenated_audio = []
+        for i, audio in enumerate(all_audio):
+            concatenated_audio.append(audio)
+            if i < len(all_audio) - 1:  # Don't add gap after last chunk
+                concatenated_audio.append(gap_audio)
+        
+        final_audio = np.concatenate(concatenated_audio)
+        logger.info(f"✅ Generated {len(final_audio)} samples ({len(final_audio)/self.sample_rate:.1f}s) from {len(chunks)} chunks")
+        
+        return final_audio, self.sample_rate
     
     def _synthesize_kokoro(self, text, voice="en_heart"):
-        """Synthesize using Kokoro TTS"""
+        """Synthesize using Kokoro TTS - processes all generator results"""
         try:
             # Generate audio using Kokoro
             generator = self.kokoro_pipeline(text, voice=voice)
             
-            # Get the first (and likely only) result
+            # Collect ALL audio segments from generator
+            audio_segments = []
             for i, (gs, ps, audio) in enumerate(generator):
-                if i == 0:  # Take first result
-                    # Convert to numpy array if needed
-                    if isinstance(audio, torch.Tensor):
-                        audio = audio.cpu().numpy()
-                    
-                    # Ensure float32 format
-                    audio = audio.astype(np.float32)
-                    
-                    # Normalize audio if needed (Kokoro outputs normalized [-1, 1])
-                    if np.max(np.abs(audio)) > 1.0:
-                        audio = audio / np.max(np.abs(audio))
-                    
-                    logger.debug(f"Kokoro generated {len(audio)} samples at {self.sample_rate}Hz")
-                    return audio, self.sample_rate
-                    
-            logger.warning("Kokoro generator returned no audio")
-            raise RuntimeError("No audio generated by Kokoro")
+                # Convert to numpy array if needed
+                if isinstance(audio, torch.Tensor):
+                    audio = audio.cpu().numpy()
+                
+                # Ensure float32 format
+                audio = audio.astype(np.float32)
+                
+                # Normalize audio if needed (Kokoro outputs normalized [-1, 1])
+                if np.max(np.abs(audio)) > 1.0:
+                    audio = audio / np.max(np.abs(audio))
+                
+                audio_segments.append(audio)
+                logger.debug(f"Kokoro segment {i+1}: {len(audio)} samples at {self.sample_rate}Hz")
+            
+            if not audio_segments:
+                logger.warning("Kokoro generator returned no audio")
+                raise RuntimeError("No audio generated by Kokoro")
+            
+            # Concatenate all segments for this chunk
+            full_audio = np.concatenate(audio_segments) if len(audio_segments) > 1 else audio_segments[0]
+            logger.debug(f"Kokoro total: {len(full_audio)} samples ({len(full_audio)/self.sample_rate:.1f}s) from {len(audio_segments)} segments")
+            return full_audio, self.sample_rate
             
         except Exception as e:
             logger.error(f"Kokoro synthesis error: {e}")
