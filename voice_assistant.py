@@ -62,31 +62,63 @@ class Agent:
         logger.info(f"{self.__class__.__name__} stopped.")
 
 class WebSocketAgent(Agent):
-    """Handles WebSocket communication and streaming Voice Activity Detection (VAD)."""
+    """Handles WebSocket communication with simple 5-second recording."""
     def __init__(self, app: 'VoiceAssistant', websocket: WebSocket):
         super().__init__(app)
         self.websocket = websocket
         self.client_id = str(id(websocket))
         self.audio_buffer = []
         self.voice_mode_enabled = False
-        self.vad_timer: Optional[asyncio.TimerHandle] = None
-        self.VAD_TIMEOUT = 1.5
+        self.recording_timer: Optional[asyncio.TimerHandle] = None
+        self.RECORDING_DURATION = 5.0  # 5 seconds of recording
+        self.is_recording = False
 
-    async def _process_vad_buffer(self):
-        if not self.audio_buffer:
-            await self.app.comms_out_queue.put({"type": "log", "level": "warning", "message": "⚠️ VAD timeout but no audio", "websocket": self.websocket})
-            await self.app.comms_out_queue.put({"type": "vad_status", "status": "listening", "websocket": self.websocket})
+    async def _start_recording_timer(self):
+        """Start 5-second recording after TTS finishes"""
+        if self.recording_timer:
+            self.recording_timer.cancel()
+        
+        # Wait a bit for TTS to finish playing, then start recording
+        await asyncio.sleep(1.0)  
+        
+        if not self.voice_mode_enabled:
             return
             
-        await self.app.comms_out_queue.put({"type": "vad_status", "status": "processing", "websocket": self.websocket})
-        await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": f"🧠 Processing {len(self.audio_buffer)} audio chunks ({sum(len(chunk) for chunk in self.audio_buffer)} bytes)", "websocket": self.websocket})
+        await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": "🎤 Starting 5-second recording...", "websocket": self.websocket})
+        await self.app.comms_out_queue.put({"type": "vad_status", "status": "listening", "websocket": self.websocket})
         
-        # Combine all audio chunks
-        full_audio_bytes = b"".join(self.audio_buffer)
-        self.audio_buffer = []  # Clear buffer
+        self.is_recording = True
+        self.audio_buffer = []
         
-        # Send to STT processing
-        await self.app.stt_in_queue.put({"audio_bytes": full_audio_bytes, "websocket": self.websocket})
+        # Set timer to stop recording after 5 seconds
+        loop = asyncio.get_running_loop()
+        self.recording_timer = loop.call_later(self.RECORDING_DURATION, self._recording_timeout_callback)
+
+    def _recording_timeout_callback(self):
+        """Called when 5-second recording is complete"""
+        asyncio.create_task(self._process_recorded_audio())
+
+    async def _process_recorded_audio(self):
+        """Process the 5 seconds of recorded audio"""
+        try:
+            self.is_recording = False
+            
+            if not self.audio_buffer:
+                await self.app.comms_out_queue.put({"type": "log", "level": "warning", "message": "⚠️ No audio recorded in 5 seconds", "websocket": self.websocket})
+                # Start another recording cycle
+                asyncio.create_task(self._start_recording_timer())
+                return
+            
+            buffer_count = len(self.audio_buffer)
+            await self.app.comms_out_queue.put({"type": "vad_status", "status": "processing", "websocket": self.websocket})
+            await self.app.comms_out_queue.put({"type": "log", "level": "success", "message": f"🎙️ Recording complete! Processing {buffer_count} chunks", "websocket": self.websocket})
+            
+            # Send audio chunks directly to STT for processing
+            await self.app.stt_in_queue.put({"audio_chunks": self.audio_buffer.copy(), "websocket": self.websocket})
+            self.audio_buffer = []
+            
+        except Exception as e:
+            await self.app.comms_out_queue.put({"type": "log", "level": "error", "message": f"❌ Recording processing error: {e}", "websocket": self.websocket})
 
     async def run(self):
         try:
@@ -114,30 +146,28 @@ class WebSocketAgent(Agent):
                         await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": "🎤 Voice mode enabled - sending greeting", "websocket": self.websocket})
                         # Send greeting to chat UI
                         await self.app.comms_out_queue.put({"type": "response", "text": greeting_text, "websocket": self.websocket})
-                        # Send greeting to TTS (force fallback for initial greeting to ensure it works)
-                        await self.app.tts_in_queue.put({"text": greeting_text, "websocket": self.websocket, "use_fallback": False})
-                        await self.app.comms_out_queue.put({"type": "vad_status", "status": "listening", "websocket": self.websocket})
+                        # Send greeting to TTS and start recording after it finishes
+                        await self.app.tts_in_queue.put({"text": greeting_text, "websocket": self.websocket, "use_fallback": False, "start_recording": True})
                     else:
                         await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": "🔇 Voice mode disabled", "websocket": self.websocket})
-                        if self.vad_timer: self.vad_timer.cancel()
+                        if self.recording_timer: 
+                            self.recording_timer.cancel()
                         self.audio_buffer = []
+                        self.is_recording = False
 
-                elif msg_type == 'audio_chunk' and self.voice_mode_enabled:
+                elif msg_type == 'audio_chunk' and self.voice_mode_enabled and self.is_recording:
                     if audio_b64 := message.get('data', ''):
-                        self.audio_buffer.append(base64.b64decode(audio_b64))
+                        audio_data = base64.b64decode(audio_b64)
+                        self.audio_buffer.append(audio_data)
                         
-                        # Only update VAD status on first chunk or after silence
-                        if len(self.audio_buffer) == 1:
-                            await self.app.comms_out_queue.put({"type": "vad_status", "status": "speaking", "websocket": self.websocket})
-                            await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": "🎤 Started receiving audio", "websocket": self.websocket})
-                        
-                        # Reset VAD timer
-                        if self.vad_timer: 
-                            self.vad_timer.cancel()
-                        self.vad_timer = asyncio.get_running_loop().call_later(
-                            self.VAD_TIMEOUT, 
-                            lambda: asyncio.create_task(self._process_vad_buffer())
-                        )
+                        # Simple logging every 20 chunks
+                        if len(self.audio_buffer) % 20 == 0:
+                            await self.app.comms_out_queue.put({"type": "log", "level": "debug", "message": f"📼 Recording: {len(self.audio_buffer)} chunks", "websocket": self.websocket})
+
+                elif msg_type == 'start_next_recording':
+                    # Message from TTS agent to start next recording cycle
+                    if self.voice_mode_enabled:
+                        asyncio.create_task(self._start_recording_timer())
 
                 elif msg_type == 'text_message':
                     user_text = message.get("text")
@@ -147,7 +177,7 @@ class WebSocketAgent(Agent):
         except WebSocketDisconnect:
             logger.info(f"Client {self.client_id} disconnected.")
         finally:
-            if self.vad_timer: self.vad_timer.cancel()
+            if self.recording_timer: self.recording_timer.cancel()
             self.app.active_clients.pop(self.websocket, None)
 
 class STTAgent(Agent):
@@ -200,7 +230,7 @@ class LLMAgent(Agent):
                 # Only synthesize speech if the original input was voice
                 if source == "voice":
                     await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": "🎵 Sending LLM response to TTS for voice synthesis", "websocket": ws})
-                    await self.app.tts_in_queue.put({"text": response_text, "websocket": ws})
+                    await self.app.tts_in_queue.put({"text": response_text, "websocket": ws, "start_recording": True})
                 else:
                     await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": "📝 Text mode - skipping TTS synthesis", "websocket": ws})
                     
@@ -216,6 +246,7 @@ class TTSAgent(Agent):
             job = await self.app.tts_in_queue.get()
             ws, text = job["websocket"], job["text"]
             use_fallback = job.get("use_fallback", False)
+            start_recording = job.get("start_recording", False)
             try:
                 await self.app.comms_out_queue.put({"type": "status", "component": "tts", "status": "🟡 Speaking...", "websocket": ws})
                 await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": f"🎵 TTS Agent processing: '{text[:50]}...' (fallback={use_fallback})", "websocket": ws})
@@ -232,6 +263,13 @@ class TTSAgent(Agent):
                     await self.app.comms_out_queue.put({"type": "log", "level": "success", "message": f"✅ TTS generated {len(audio_data)} audio samples at {sample_rate}Hz", "websocket": ws})
                     audio_b64 = base64.b64encode((audio_data * 32767).astype(np.int16).tobytes()).decode('utf-8')
                     await self.app.comms_out_queue.put({"type": "tts_audio", "audio": audio_b64, "sample_rate": sample_rate, "text": text, "websocket": ws})
+                    
+                    # After TTS completes, trigger next recording cycle if requested
+                    if start_recording:
+                        ws_agent = self.app.active_clients.get(ws)
+                        if ws_agent:
+                            await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": "🎤 TTS finished - starting recording cycle", "websocket": ws})
+                            asyncio.create_task(ws_agent._start_recording_timer())
                 else:
                     await self.app.comms_out_queue.put({"type": "log", "level": "warning", "message": "⚠️ TTS returned no audio data", "websocket": ws})
                     
