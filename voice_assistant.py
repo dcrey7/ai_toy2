@@ -34,6 +34,7 @@ sys.path.append(str(Path(__file__).parent / "backend"))
 from services.kyutai_service import KyutaiSTTService
 from services.tts_service import LocalTTSService
 from services.ollama_service import OllamaService
+from services.smart_turn_vad import SmartTurnVADService
 
 # Setup root logger
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -62,63 +63,108 @@ class Agent:
         logger.info(f"{self.__class__.__name__} stopped.")
 
 class WebSocketAgent(Agent):
-    """Handles WebSocket communication with simple 5-second recording."""
+    """Handles WebSocket communication with Smart Turn v2 hands-free recording."""
     def __init__(self, app: 'VoiceAssistant', websocket: WebSocket):
         super().__init__(app)
         self.websocket = websocket
         self.client_id = str(id(websocket))
-        self.audio_buffer = []
         self.voice_mode_enabled = False
-        self.recording_timer: Optional[asyncio.TimerHandle] = None
-        self.RECORDING_DURATION = 5.0  # 5 seconds of recording
-        self.is_recording = False
+        self.is_streaming_audio = False
+        
+        # Smart Turn v2 VAD service for this client
+        self.vad_service: Optional[SmartTurnVADService] = None
+        self.turn_detection_task: Optional[asyncio.Task] = None
 
-    async def _start_recording_timer(self):
-        """Start 5-second recording after TTS finishes"""
-        if self.recording_timer:
-            self.recording_timer.cancel()
-        
-        # Wait a bit for TTS to finish playing, then start recording
-        await asyncio.sleep(1.0)  
-        
-        if not self.voice_mode_enabled:
-            return
-            
-        await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": "🎤 Starting 5-second recording...", "websocket": self.websocket})
-        await self.app.comms_out_queue.put({"type": "vad_status", "status": "listening", "websocket": self.websocket})
-        
-        self.is_recording = True
-        self.audio_buffer = []
-        
-        # Set timer to stop recording after 5 seconds
-        loop = asyncio.get_running_loop()
-        self.recording_timer = loop.call_later(self.RECORDING_DURATION, self._recording_timeout_callback)
-
-    def _recording_timeout_callback(self):
-        """Called when 5-second recording is complete"""
-        asyncio.create_task(self._process_recorded_audio())
-
-    async def _process_recorded_audio(self):
-        """Process the 5 seconds of recorded audio"""
+    async def _start_vad_service(self):
+        """Initialize Smart Turn v2 VAD service for this client"""
         try:
-            self.is_recording = False
-            
-            if not self.audio_buffer:
-                await self.app.comms_out_queue.put({"type": "log", "level": "warning", "message": "⚠️ No audio recorded in 5 seconds", "websocket": self.websocket})
-                # Start another recording cycle
-                asyncio.create_task(self._start_recording_timer())
-                return
-            
-            buffer_count = len(self.audio_buffer)
-            await self.app.comms_out_queue.put({"type": "vad_status", "status": "processing", "websocket": self.websocket})
-            await self.app.comms_out_queue.put({"type": "log", "level": "success", "message": f"🎙️ Recording complete! Processing {buffer_count} chunks", "websocket": self.websocket})
-            
-            # Send audio chunks directly to STT for processing
-            await self.app.stt_in_queue.put({"audio_chunks": self.audio_buffer.copy(), "websocket": self.websocket})
-            self.audio_buffer = []
-            
+            if self.vad_service is None:
+                self.vad_service = SmartTurnVADService(
+                    model_name="pipecat-ai/smart-turn-v2",
+                    device="cuda"
+                )
+                await self.app.comms_out_queue.put({
+                    "type": "log", 
+                    "level": "success", 
+                    "message": "✅ Smart Turn v2 VAD service initialized",
+                    "websocket": self.websocket
+                })
         except Exception as e:
-            await self.app.comms_out_queue.put({"type": "log", "level": "error", "message": f"❌ Recording processing error: {e}", "websocket": self.websocket})
+            await self.app.comms_out_queue.put({
+                "type": "log", 
+                "level": "error", 
+                "message": f"❌ VAD service init failed: {e}",
+                "websocket": self.websocket
+            })
+            raise
+
+    async def _continuous_turn_detection(self):
+        """Continuous turn detection loop for Smart Turn v2"""
+        try:
+            # Wait briefly for TTS to start, then begin VAD processing
+            await asyncio.sleep(0.5)  # Short delay to let TTS begin
+            
+            while self.voice_mode_enabled and self.is_streaming_audio:
+                if self.vad_service:
+                    is_complete, confidence, reason = self.vad_service.is_turn_complete()
+                    
+                    if is_complete:
+                        # Temporarily disable audio streaming to prevent feedback
+                        self.is_streaming_audio = False
+                        
+                        await self.app.comms_out_queue.put({
+                            "type": "log",
+                            "level": "success",
+                            "message": f"🎯 Turn complete detected (confidence: {confidence:.3f})",
+                            "websocket": self.websocket
+                        })
+                        
+                        # Update VAD status to processing
+                        await self.app.comms_out_queue.put({
+                            "type": "vad_status", 
+                            "status": "processing", 
+                            "websocket": self.websocket
+                        })
+                        
+                        # Get accumulated audio buffer and send to STT
+                        audio_buffer = self.vad_service.get_buffered_audio()
+                        if len(audio_buffer) > 0:
+                            await self.app.stt_in_queue.put({
+                                "audio_data": audio_buffer,
+                                "websocket": self.websocket,
+                                "source": "smart_turn_vad",
+                                "sample_rate": 16000
+                            })
+                            
+                            # Clear buffer after sending to STT
+                            self.vad_service.clear_buffer()
+                        else:
+                            logger.warning("⚠️ No audio buffer available for STT")
+                        
+                        # Wait before re-enabling to prevent immediate feedback
+                        await asyncio.sleep(2.0)
+                        
+                        # Re-enable streaming after AI response
+                        if self.voice_mode_enabled:
+                            self.is_streaming_audio = True
+                            await self.app.comms_out_queue.put({
+                                "type": "vad_status", 
+                                "status": "inactive", 
+                                "websocket": self.websocket
+                            })
+                
+                # Check every 100ms for responsiveness
+                await asyncio.sleep(0.1)
+                
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            await self.app.comms_out_queue.put({
+                "type": "log",
+                "level": "error",
+                "message": f"❌ Turn detection error: {e}",
+                "websocket": self.websocket
+            })
 
     async def run(self):
         try:
@@ -142,32 +188,50 @@ class WebSocketAgent(Agent):
                 if msg_type == 'toggle_voice_mode':
                     self.voice_mode_enabled = message.get('enabled', False)
                     if self.voice_mode_enabled:
+                        # Initialize VAD service and start continuous turn detection
+                        await self._start_vad_service()
+                        self.is_streaming_audio = True
+                        self.turn_detection_task = asyncio.create_task(self._continuous_turn_detection())
+                        
+                        # Send greeting
                         greeting_text = "Hi! I'm your AI voice assistant. How can I help you?"
-                        await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": "🎤 Voice mode enabled - sending greeting", "websocket": self.websocket})
-                        # Send greeting to chat UI
+                        await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": "🎤 Voice mode enabled - hands-free conversation ready", "websocket": self.websocket})
                         await self.app.comms_out_queue.put({"type": "response", "text": greeting_text, "websocket": self.websocket})
-                        # Send greeting to TTS and start recording after it finishes
-                        await self.app.tts_in_queue.put({"text": greeting_text, "websocket": self.websocket, "use_fallback": False, "start_recording": True})
+                        await self.app.tts_in_queue.put({"text": greeting_text, "websocket": self.websocket, "use_fallback": False, "is_greeting": True})
+                        
                     else:
                         await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": "🔇 Voice mode disabled", "websocket": self.websocket})
-                        if self.recording_timer: 
-                            self.recording_timer.cancel()
-                        self.audio_buffer = []
-                        self.is_recording = False
-
-                elif msg_type == 'audio_chunk' and self.voice_mode_enabled and self.is_recording:
-                    if audio_b64 := message.get('data', ''):
-                        audio_data = base64.b64decode(audio_b64)
-                        self.audio_buffer.append(audio_data)
                         
-                        # Simple logging every 20 chunks
-                        if len(self.audio_buffer) % 20 == 0:
-                            await self.app.comms_out_queue.put({"type": "log", "level": "debug", "message": f"📼 Recording: {len(self.audio_buffer)} chunks", "websocket": self.websocket})
+                        # Clean up VAD service and tasks
+                        self.is_streaming_audio = False
+                        if self.turn_detection_task and not self.turn_detection_task.done():
+                            self.turn_detection_task.cancel()
+                        if self.vad_service:
+                            self.vad_service.cleanup()
+                            self.vad_service = None
 
-                elif msg_type == 'start_next_recording':
-                    # Message from TTS agent to start next recording cycle
-                    if self.voice_mode_enabled:
-                        asyncio.create_task(self._start_recording_timer())
+                elif msg_type == 'pcm_chunk' and self.voice_mode_enabled and self.is_streaming_audio:
+                    # Real-time PCM audio chunk from frontend
+                    try:
+                        pcm_b64 = message.get('data', '')
+                        sample_rate = message.get('sampleRate', 16000)
+                        channels = message.get('channels', 1)
+                        samples = message.get('samples', 0)
+                        
+                        if pcm_b64 and self.vad_service:
+                            # Decode base64 PCM data
+                            pcm_bytes = base64.b64decode(pcm_b64)
+                            pcm_array = np.frombuffer(pcm_bytes, dtype=np.int16)
+                            
+                            # Add to VAD service buffer
+                            self.vad_service.add_pcm_chunk(pcm_array)
+                            
+                            # Update VAD status to show activity
+                            await self.app.comms_out_queue.put({"type": "vad_status", "status": "speaking", "websocket": self.websocket})
+                            
+                    except Exception as e:
+                        await self.app.comms_out_queue.put({"type": "log", "level": "error", "message": f"❌ PCM processing error: {e}", "websocket": self.websocket})
+                
 
                 elif msg_type == 'text_message':
                     user_text = message.get("text")
@@ -177,37 +241,88 @@ class WebSocketAgent(Agent):
         except WebSocketDisconnect:
             logger.info(f"Client {self.client_id} disconnected.")
         finally:
-            if self.recording_timer: self.recording_timer.cancel()
+            # Clean up VAD service and tasks
+            self.is_streaming_audio = False
+            if self.turn_detection_task and not self.turn_detection_task.done():
+                self.turn_detection_task.cancel()
+            if self.vad_service:
+                self.vad_service.cleanup()
+                self.vad_service = None
             self.app.active_clients.pop(self.websocket, None)
 
 class STTAgent(Agent):
     async def run(self):
         while True:
             job = await self.app.stt_in_queue.get()
-            ws, audio_bytes = job["websocket"], job["audio_bytes"]
+            ws = job["websocket"]
+            audio_data = job.get("audio_data")
+            source = job.get("source", "unknown")
+            sample_rate = job.get("sample_rate", 16000)
+            
             try:
                 await self.app.comms_out_queue.put({"type": "status", "component": "stt", "status": "🟡 Transcribing...", "websocket": ws})
-                await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": f"📝 STT Agent received {len(audio_bytes)} bytes of audio", "websocket": ws})
                 
-                audio_segment = AudioSegment.from_file(io.BytesIO(audio_bytes), format="webm")
-                audio_segment = audio_segment.set_frame_rate(16000).set_channels(1)
-                samples = np.array(audio_segment.get_array_of_samples()).astype(np.float32) / 32768.0
+                if audio_data is None or (isinstance(audio_data, list) and len(audio_data) == 0):
+                    raise Exception("No audio data received")
                 
-                await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": f"🔊 Converted to {len(samples)} audio samples, sending to Kyutai STT", "websocket": ws})
-                text = self.app.stt_service.transcribe(samples, sample_rate=16000)
+                # Handle different audio formats
+                if source == "smart_turn_vad":
+                    # Direct PCM data from Smart Turn v2 VAD (numpy array)
+                    if isinstance(audio_data, np.ndarray):
+                        samples = audio_data.astype(np.float32)
+                        await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": f"📝 Processing Smart Turn v2 VAD audio: {len(samples)} samples ({len(samples)/sample_rate:.1f}s)", "websocket": ws})
+                    else:
+                        raise Exception("Expected numpy array for Smart Turn v2 VAD data")
+                        
+                else:
+                    # Legacy WebM format (list of byte chunks)
+                    await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": f"📝 Processing legacy WebM recording ({len(audio_data)} chunks)", "websocket": ws})
+                    
+                    import tempfile
+                    combined_data = b''.join(audio_data)
+                    temp_file = None
+                    
+                    with tempfile.NamedTemporaryFile(suffix='.webm', delete=False) as tmp:
+                        tmp.write(combined_data)
+                        temp_file = tmp.name
+                    
+                    try:
+                        audio_segment = AudioSegment.from_file(temp_file, format="webm")
+                        audio_segment = audio_segment.set_frame_rate(16000).set_channels(1)
+                        samples = np.array(audio_segment.get_array_of_samples()).astype(np.float32) / 32768.0
+                        
+                        await self.app.comms_out_queue.put({"type": "log", "level": "success", "message": f"✅ Successfully processed WebM: {len(samples)} samples ({len(samples)/16000:.1f}s)", "websocket": ws})
+                        
+                    except Exception as decode_error:
+                        await self.app.comms_out_queue.put({"type": "log", "level": "error", "message": f"❌ Audio decoding failed: {decode_error}", "websocket": ws})
+                        raise Exception(f"Audio decoding failed: {decode_error}")
+                    finally:
+                        # Clean up temp file
+                        if temp_file and os.path.exists(temp_file):
+                            os.unlink(temp_file)
                 
-                if text:
+                # Check if we have meaningful audio (more than 0.5 seconds)
+                if len(samples) < sample_rate * 0.5:  # Less than 0.5 seconds
+                    await self.app.comms_out_queue.put({"type": "log", "level": "warning", "message": f"⚠️ Audio too short for transcription: {len(samples)/sample_rate:.1f}s", "websocket": ws})
+                    text = ""
+                else:
+                    await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": f"🔊 Transcribing {len(samples)/sample_rate:.1f}s of audio with Kyutai STT", "websocket": ws})
+                    text = self.app.stt_service.transcribe(samples, sample_rate=sample_rate)
+                
+                if text and text.strip():
                     await self.app.comms_out_queue.put({"type": "log", "level": "success", "message": f"✅ STT transcription: '{text}'", "websocket": ws})
                     await self.app.comms_out_queue.put({"type": "transcript", "text": text, "is_final": True, "websocket": ws})
                     await self.app.llm_in_queue.put({"text": text, "websocket": ws, "source": "voice"})
                 else:
-                    await self.app.comms_out_queue.put({"type": "log", "level": "warning", "message": "⚠️ STT returned empty transcription", "websocket": ws})
+                    await self.app.comms_out_queue.put({"type": "log", "level": "warning", "message": "⚠️ STT returned empty transcription - Smart Turn v2 continues listening", "websocket": ws})
+                        
             except Exception as e:
                 logger.error(f"STTAgent error: {e}")
                 await self.app.comms_out_queue.put({"type": "log", "level": "error", "message": f"❌ STT Error: {e}", "websocket": ws})
+                # Smart Turn v2 continues listening automatically on error
             finally:
                 await self.app.comms_out_queue.put({"type": "status", "component": "stt", "status": "🟢 Ready", "websocket": ws})
-                await self.app.comms_out_queue.put({"type": "vad_status", "status": "listening", "websocket": ws})
+                await self.app.comms_out_queue.put({"type": "vad_status", "status": "idle", "websocket": ws})
 
 class LLMAgent(Agent):
     async def run(self):
@@ -230,7 +345,7 @@ class LLMAgent(Agent):
                 # Only synthesize speech if the original input was voice
                 if source == "voice":
                     await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": "🎵 Sending LLM response to TTS for voice synthesis", "websocket": ws})
-                    await self.app.tts_in_queue.put({"text": response_text, "websocket": ws, "start_recording": True})
+                    await self.app.tts_in_queue.put({"text": response_text, "websocket": ws})
                 else:
                     await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": "📝 Text mode - skipping TTS synthesis", "websocket": ws})
                     
@@ -246,7 +361,7 @@ class TTSAgent(Agent):
             job = await self.app.tts_in_queue.get()
             ws, text = job["websocket"], job["text"]
             use_fallback = job.get("use_fallback", False)
-            start_recording = job.get("start_recording", False)
+            is_greeting = job.get("is_greeting", False)
             try:
                 await self.app.comms_out_queue.put({"type": "status", "component": "tts", "status": "🟡 Speaking...", "websocket": ws})
                 await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": f"🎵 TTS Agent processing: '{text[:50]}...' (fallback={use_fallback})", "websocket": ws})
@@ -264,12 +379,13 @@ class TTSAgent(Agent):
                     audio_b64 = base64.b64encode((audio_data * 32767).astype(np.int16).tobytes()).decode('utf-8')
                     await self.app.comms_out_queue.put({"type": "tts_audio", "audio": audio_b64, "sample_rate": sample_rate, "text": text, "websocket": ws})
                     
-                    # After TTS completes, trigger next recording cycle if requested
-                    if start_recording:
-                        ws_agent = self.app.active_clients.get(ws)
-                        if ws_agent:
-                            await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": "🎤 TTS finished - starting recording cycle", "websocket": ws})
-                            asyncio.create_task(ws_agent._start_recording_timer())
+                    # TTS completed successfully 
+                    if is_greeting:
+                        # After greeting TTS finishes, start VAD listening with a brief delay
+                        await asyncio.sleep(1.0)  # Wait 1 second after greeting ends
+                        await self.app.comms_out_queue.put({"type": "vad_status", "status": "inactive", "websocket": ws})
+                        await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": "🎤 Greeting finished - Smart Turn v2 VAD now listening for your voice", "websocket": ws})
+                    # Smart Turn v2 handles turn detection automatically for all other responses
                 else:
                     await self.app.comms_out_queue.put({"type": "log", "level": "warning", "message": "⚠️ TTS returned no audio data", "websocket": ws})
                     

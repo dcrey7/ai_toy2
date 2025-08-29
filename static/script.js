@@ -11,6 +11,8 @@ class VoiceAssistant {
         this.audioStream = null;
         this.audioContext = null; // Master audio context
         
+        this.audioState = 'idle'; // idle|ai_speaking|user_listening|processing
+        
         this.chatMessages = document.getElementById('chatMessages');
         this.chatInput = document.getElementById('chatInput');
         this.sendButton = document.getElementById('sendButton');
@@ -25,6 +27,7 @@ class VoiceAssistant {
         this.connectWebSocket();
         this.initCamera();
     }
+    
     
     setupUI() {
         const controlsHTML = `
@@ -80,10 +83,9 @@ class VoiceAssistant {
                 case 'response': this.addMessage('assistant', message.text); break;
                 case 'status': this.updateSystemStatus(message.component, message.status); break;
                 case 'vad_status': this.updateVadStatus(message.status); break;
+                case 'recording_control': this.handleRecordingControl(message); break;
                 case 'tts_audio':
-                    this.playTTSAudio(message.audio, message.sample_rate);
-                    // The text is already added from the 'response' message type.
-                    // if (message.text) this.addMessage('assistant', message.text);
+                    this.handleTTSAudio(message);
                     break;
                 case 'log': window.logger.log(message.level, message.message); break;
                 default: window.logger.debug(JSON.stringify(message));
@@ -91,6 +93,12 @@ class VoiceAssistant {
         } catch (error) {
             window.logger.error(`WebSocket parse error: ${error.message}`);
         }
+    }
+    
+    
+    
+    handleTTSAudio(message) {
+        this.playTTSAudio(message.audio, message.sample_rate);
     }
     
     switchToTextMode() {
@@ -117,43 +125,165 @@ class VoiceAssistant {
     
     async startVoice() {
         try {
-            // 1. Create/resume master audio context on user gesture
-            if (!this.audioContext) this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-            this.audioContext.resume();
+            // Use WebSocket audio implementation
+            await this.startWebSocketVoice();
+            
+        } catch (error) {
+            console.error('Voice setup error:', error);
+            
+            // Provide more specific error messages
+            let errorMessage = '';
+            if (error.name === 'NotAllowedError') {
+                errorMessage = 'Microphone access denied. Please allow microphone permissions and try again.';
+            } else if (error.name === 'NotFoundError') {
+                errorMessage = 'No microphone found. Please connect a microphone and try again.';
+            } else if (error.name === 'NotReadableError') {
+                errorMessage = 'Microphone is already in use by another application.';
+            } else if (error.message.includes('createScriptProcessorNode')) {
+                errorMessage = 'Browser audio processing not supported. Please try a modern browser like Chrome or Firefox.';
+            } else {
+                errorMessage = `Voice setup failed: ${error.message}`;
+            }
+            
+            window.logger.error(`❌ ${errorMessage}`);
+            alert(errorMessage);
+            
+            // Reset voice mode on error
+            this.voiceModeBtn.classList.remove('active');
+            this.textModeBtn.classList.add('active');
+            this.switchToTextMode();
+        }
+    }
+    
+    
+    async startWebSocketVoice() {
+        try {
+            // 1. Create audio context optimized for 16kHz (Smart Turn v2 requirement)
+            if (!this.audioContext) {
+                this.audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                    sampleRate: 16000  // Smart Turn v2 expects 16kHz
+                });
+            }
+            await this.audioContext.resume();
 
-            this.audioStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 16000 } });
-            this.mediaRecorder = new MediaRecorder(this.audioStream, { mimeType: 'audio/webm;codecs=opus' });
+            // 2. Get microphone stream optimized for voice AI
+            this.audioStream = await navigator.mediaDevices.getUserMedia({ 
+                audio: { 
+                    echoCancellation: true,      // Essential for voice assistants
+                    noiseSuppression: true,      // Remove background noise
+                    autoGainControl: true,       // Normalize volume
+                    channelCount: 1,             // Mono for efficiency
+                    sampleRate: 16000,           // Smart Turn v2 optimal rate
+                    sampleSize: 16               // 16-bit depth
+                } 
+            });
+
+            // 3. Set up Web Audio API for real-time PCM streaming using modern AudioWorklet
+            const source = this.audioContext.createMediaStreamSource(this.audioStream);
             
-            // 2. When data is available, send it immediately to the backend
-            this.mediaRecorder.ondataavailable = (event) => {
-                if (event.data.size > 0 && this.socket.readyState === WebSocket.OPEN) {
-                    const reader = new FileReader();
-                    reader.onload = () => {
-                        const base64Data = reader.result.split(',')[1];
-                        this.socket.send(JSON.stringify({ type: 'audio_chunk', data: base64Data }));
-                    };
-                    reader.readAsDataURL(event.data);
-                }
-            };
+            // Create a ScriptProcessor fallback for browsers that don't support AudioWorklet
+            // Use 4096 samples (~256ms at 16kHz) for good balance of latency vs stability
+            try {
+                // Try modern AudioWorklet first (preferred method)
+                await this.audioContext.audioWorklet.addModule('/static/pcm-processor.js');
+                this.audioProcessor = new AudioWorkletNode(this.audioContext, 'pcm-processor');
+                
+                // Handle PCM data from AudioWorklet
+                this.audioProcessor.port.onmessage = (event) => {
+                    if (this.socket.readyState === WebSocket.OPEN && this.audioState === 'user_listening') {
+                        const pcmData = event.data;
+                        const base64Data = btoa(String.fromCharCode.apply(null, new Uint8Array(pcmData.buffer)));
+                        
+                        this.socket.send(JSON.stringify({ 
+                            type: 'pcm_chunk', 
+                            data: base64Data,
+                            sampleRate: this.audioContext.sampleRate,
+                            channels: 1,
+                            samples: pcmData.length
+                        }));
+                    }
+                };
+                
+                window.logger.success('🎵 Using modern AudioWorklet for PCM streaming');
+                
+            } catch (error) {
+                // Fallback to ScriptProcessorNode for older browsers
+                window.logger.info('📻 Falling back to ScriptProcessorNode');
+                
+                this.audioProcessor = this.audioContext.createScriptProcessorNode(4096, 1, 1);
+                
+                // 4. Real-time PCM streaming to Smart Turn v2 VAD
+                this.audioProcessor.onaudioprocess = (audioProcessingEvent) => {
+                    if (this.socket.readyState === WebSocket.OPEN && this.audioState === 'user_listening') {
+                        const inputBuffer = audioProcessingEvent.inputBuffer;
+                        const inputData = inputBuffer.getChannelData(0); // Mono channel
+                        
+                        // Convert Float32 to Int16 for efficient transmission
+                        const int16Array = new Int16Array(inputData.length);
+                        for (let i = 0; i < inputData.length; i++) {
+                            // Clamp and convert to 16-bit signed integer
+                            int16Array[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
+                        }
+                        
+                        // Send raw PCM chunk to Smart Turn v2 VAD
+                        const base64Data = btoa(String.fromCharCode.apply(null, new Uint8Array(int16Array.buffer)));
+                        
+                        this.socket.send(JSON.stringify({ 
+                            type: 'pcm_chunk', 
+                            data: base64Data,
+                            sampleRate: this.audioContext.sampleRate,
+                            channels: 1,
+                            samples: inputData.length
+                        }));
+                    }
+                };
+            }
             
-            this.mediaRecorder.start(250); // Send audio chunks every 250ms
+            // 5. Connect audio processing graph
+            source.connect(this.audioProcessor);
+            this.audioProcessor.connect(this.audioContext.destination); // Connect to destination to prevent GC
+            
+            // 6. Update UI and enable hands-free voice mode
             this.isRecording = true;
+            this.audioState = 'user_listening';
             this.voiceToggle.textContent = '⏹️ Stop Conversation';
             this.voiceToggle.className = 'voice-button stop';
             this.socket.send(JSON.stringify({ type: 'toggle_voice_mode', enabled: true }));
+            
+            window.logger.success('🎤 Real-time PCM streaming started - hands-free conversation enabled!');
+            
         } catch (error) {
-            alert('Failed to start voice recording. Please check microphone permissions.');
+            throw error;
         }
     }
     
     stopVoice() {
-        if (this.mediaRecorder && this.mediaRecorder.state === 'recording') this.mediaRecorder.stop();
-        if (this.audioStream) this.audioStream.getTracks().forEach(track => track.stop());
+        // Clean up Web Audio API components
+        if (this.audioProcessor) {
+            this.audioProcessor.disconnect();
+            this.audioProcessor = null;
+        }
+        
+        // Stop audio stream
+        if (this.audioStream) {
+            this.audioStream.getTracks().forEach(track => track.stop());
+            this.audioStream = null;
+        }
+        
         this.isRecording = false;
         this.voiceToggle.textContent = '🎤 Start Conversation';
         this.voiceToggle.className = 'voice-button start';
         this.socket.send(JSON.stringify({ type: 'toggle_voice_mode', enabled: false }));
         this.updateVadStatus('inactive');
+        
+        window.logger.info('🔇 Real-time PCM streaming stopped');
+    }
+
+    handleRecordingControl(message) {
+        // Smart Turn v2 handles turn detection automatically
+        // This is kept for compatibility but not used in hands-free mode
+        const action = message.action;
+        window.logger.debug(`Recording control: ${action}`);
     }
     
     sendTextMessage() {
@@ -199,9 +329,25 @@ class VoiceAssistant {
     updateVadStatus(status) {
         if (!this.vadStatus) return;
         this.vadStatus.className = `vad-status ${status}`;
-        if (status === 'speaking') this.vadStatus.textContent = '🎤 You are speaking...';
-        else if (status === 'processing') this.vadStatus.textContent = '🧠 Thinking...';
-        else this.vadStatus.textContent = '⚪ Waiting for you to speak';
+        
+        switch (status) {
+            case 'speaking':
+                this.vadStatus.textContent = '🎤 You are speaking...';
+                break;
+            case 'processing':
+                this.vadStatus.textContent = '🧠 Processing your message...';
+                break;
+            case 'ai_speaking':
+                this.vadStatus.textContent = '🤖 AI is speaking...';
+                break;
+            case 'listening':
+                this.vadStatus.textContent = '👂 Listening for your voice...';
+                break;
+            case 'inactive':
+            default:
+                this.vadStatus.textContent = '⚪ Voice mode inactive';
+                break;
+        }
     }
     
     addMessage(type, content) {
