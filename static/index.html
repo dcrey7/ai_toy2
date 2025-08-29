@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Voice Assistant</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="left-panel">
+        <div class="video-container">
+            <video id="videoFeed" autoplay playsinline></video>
+            <div class="video-overlay" id="videoStatus">Camera Ready</div>
+        </div>
+        
+        <div class="controls-section" id="controlsContainer">
+            <!-- Voice controls will be injected here by JavaScript -->
+        </div>
+        
+    </div>
+
+    <div class="chat-panel">
+        <div class="chat-header">
+            <div>AI Voice Assistant</div>
+            <div class="tabs-container">
+                <div class="tab active" id="chatTab" onclick="switchTab('chat')">Chat</div>
+                <div class="tab" id="logsTab" onclick="switchTab('logs')">Logs</div>
+            </div>
+        </div>
+        
+        <div class="tab-content" id="chatContent">
+            <div class="chat-messages" id="chatMessages">
+                <div class="message assistant">
+                    <div>👋 Hello! I'm your AI voice assistant.</div>
+                    <div><strong>Voice Chat:</strong> Click "Voice Chat" → "Start Voice Chat" → Speak! Your words appear here live.</div>
+                    <div><strong>Text Chat:</strong> Type in the box below for regular text conversation.</div>
+                    <div class="timestamp">Ready</div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="tab-content hidden" id="logsContent">
+            <div class="logs-container" id="logsContainer">
+                <!-- Real-time logs will appear here -->
+            </div>
+        </div>
+        
+        <div class="chat-input-container" id="chatInputContainer">
+            <textarea class="chat-input" id="chatInput" placeholder="Type your message here..." rows="1"></textarea>
+            <button class="send-button" id="sendButton">Send</button>
+        </div>
+    </div>
+
+    <canvas id="canvas" class="hidden"></canvas>
+
+    <script src="/static/script.js"></script>
+</body>
+</html>

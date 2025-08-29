@@ -1,0 +1,31 @@
+[project]
+name = "ai-toy2"
+version = "0.1.0"
+description = "Local Voice Assistant with Smart Vision"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.0.0",
+    "transformers>=4.42.4",
+    "accelerate",
+    "librosa",
+    "phonemizer",
+    "soundfile>=0.12.0",
+    "opencv-python>=4.8.0",
+    "requests>=2.31.0",
+    "aiohttp>=3.9.0",
+    "numpy>=1.24.0",
+    "Pillow>=10.0.0",
+    "python-dotenv>=1.0.0",
+    "PyYAML>=6.0",
+    "websockets>=11.0",
+    "pipecat>=0.3.0",
+    "webrtcvad>=2.0.10",
+    "scipy>=1.10.0",
+    "torchaudio>=2.0.0",
+    "cryptography>=3.0.0",
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "numba>=0.61.2",
+    "pip>=25.2",
+]

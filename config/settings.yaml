@@ -1,0 +1,48 @@
+# AI Voice Assistant Configuration
+# Optimized for RTX 3050 6GB VRAM
+
+# Models Configuration
+models:
+  # STT Model (Local Whisper) - Optimized for RTX 3050 6GB VRAM
+  stt:
+    model_name: "kyutai/stt-1b-en_fr-trfs"
+    device: "cuda"
+    
+  # LLM Model (Your existing Ollama)
+  llm:
+    base_url: "http://localhost:11434"
+    model_name: "gemma3:1b"  # Using 1B model for optimal VRAM usage (was 4b)
+    # Alternative: "mistral:latest" if you want to try your other model
+    
+  # TTS Model
+  tts:
+    primary: "kokoro"  # Use high-quality TTS
+    device: "cuda"     # Specify device for Kokoro
+    fallback: "espeak" # Fallback if Kokoro fails
+    
+  # Vision Model (Same as conversation for simplicity)
+  vision:
+    base_url: "http://localhost:11434" 
+    model_name: "gemma3:1b"
+
+# Audio Configuration  
+audio:
+  sample_rate: 16000
+  channels: 1
+  chunk_duration_ms: 250  # 250ms chunks for responsiveness
+  
+# VAD Configuration
+vad:
+  silence_duration_ms: 1500  # 1.5s silence = end of turn
+  min_speech_duration_ms: 300  # Minimum speech to trigger
+  
+# Performance Configuration
+performance:
+  max_vram_gb: 4.0  # Leave 2GB buffer on 6GB card
+  enable_torch_compile: false  # Disable for compatibility
+  
+# Server Configuration
+server:
+  host: "0.0.0.0"
+  port: 8080
+  debug: true
