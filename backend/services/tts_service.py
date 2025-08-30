@@ -10,7 +10,17 @@ import tempfile
 import os
 import logging
 import numpy as np
+import torch.multiprocessing as mp
+import queue
+import signal
+import time
 from pathlib import Path
+
+# Set multiprocessing start method for CUDA compatibility
+try:
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass  # Context already set
 
 logger = logging.getLogger(__name__)
 
@@ -150,13 +160,13 @@ class LocalTTSService:
             logger.error("❌ espeak not available! Please install: sudo apt install espeak")
             self.espeak_available = False
     
-    def synthesize(self, text, voice="en_heart", force_fallback=False):
+    def synthesize(self, text, voice="af", force_fallback=False):
         """
         Convert text to speech audio with automatic chunking for long text
         
         Args:
             text (str): Text to synthesize
-            voice (str): Voice to use (default: 'en_heart' for Kokoro)
+            voice (str): Voice to use (default: 'af' for Kokoro)
             force_fallback (bool): If true, forces use of espeak
             
         Returns:
@@ -218,7 +228,7 @@ class LocalTTSService:
         
         return final_audio, self.sample_rate
     
-    def _synthesize_kokoro(self, text, voice="en_heart"):
+    def _synthesize_kokoro(self, text, voice="af"):
         """Synthesize using Kokoro TTS - processes all generator results"""
         try:
             # Generate audio using Kokoro
@@ -304,3 +314,272 @@ class LocalTTSService:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             logger.info("TTS model cleaned up")
+
+
+def _tts_worker_process(input_queue, output_queue, primary_engine="kokoro", device="cuda"):
+    """
+    TTS worker process function - runs in isolated process
+    Based on Pipecat's process isolation pattern
+    """
+    try:
+        # Initialize TTS service in isolated process
+        tts_service = LocalTTSService(primary_engine=primary_engine, device=device)
+        logger.info(f"✅ TTS worker process initialized with {primary_engine} engine")
+        
+        # Set up signal handler for graceful shutdown
+        def signal_handler(signum, frame):
+            logger.info("TTS worker received shutdown signal")
+            tts_service.cleanup()
+            os._exit(0)
+            
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
+        
+        while True:
+            try:
+                # Wait for TTS job from main process
+                job = input_queue.get(timeout=30)  # 30 second timeout
+                
+                if job is None:  # Shutdown signal
+                    logger.info("TTS worker received shutdown signal")
+                    break
+                
+                job_id = job["id"]
+                text = job["text"]
+                voice = job.get("voice", "af")
+                force_fallback = job.get("force_fallback", False)
+                
+                logger.debug(f"TTS worker processing job {job_id}: '{text[:50]}...'")
+                
+                # Generate audio
+                start_time = time.time()
+                audio_data, sample_rate = tts_service.synthesize(text, voice, force_fallback)
+                duration = time.time() - start_time
+                
+                # Send result back to main process
+                result = {
+                    "id": job_id,
+                    "audio": audio_data.tobytes(),
+                    "sample_rate": sample_rate,
+                    "duration": duration,
+                    "success": True
+                }
+                output_queue.put(result)
+                
+                logger.debug(f"TTS job {job_id} completed in {duration:.2f}s")
+                
+            except queue.Empty:
+                # Timeout - keep process alive but check for shutdown
+                continue
+            except Exception as e:
+                logger.error(f"TTS worker error: {e}")
+                # Send error result
+                try:
+                    error_result = {
+                        "id": job.get("id", "unknown"),
+                        "error": str(e),
+                        "success": False
+                    }
+                    output_queue.put(error_result)
+                except:
+                    pass
+                continue
+                    
+    except Exception as e:
+        logger.error(f"TTS worker process failed to initialize: {e}")
+    finally:
+        try:
+            tts_service.cleanup()
+        except:
+            pass
+        logger.info("TTS worker process exiting")
+
+
+class IsolatedTTSService:
+    """
+    TTS service that runs synthesis in an isolated process
+    Based on Pipecat's process isolation pattern for stability
+    """
+    
+    def __init__(self, primary_engine="kokoro", device="cuda", max_retries=3):
+        self.primary_engine = primary_engine
+        self.device = device
+        self.max_retries = max_retries
+        self.process = None
+        self.input_queue = None
+        self.output_queue = None
+        self.job_counter = 0
+        self.pending_jobs = {}  # Track pending jobs for timeout handling
+        
+        # Fallback TTS for emergencies
+        self.fallback_tts = LocalTTSService(primary_engine="espeak", device="cpu")
+        
+        # Start the worker process
+        self._start_worker()
+    
+    def _start_worker(self):
+        """Start the TTS worker process"""
+        try:
+            # Create multiprocessing queues
+            self.input_queue = mp.Queue(maxsize=10)  # Limit queue size
+            self.output_queue = mp.Queue(maxsize=10)
+            
+            # Start worker process
+            self.process = mp.Process(
+                target=_tts_worker_process,
+                args=(self.input_queue, self.output_queue, self.primary_engine, self.device),
+                daemon=False
+            )
+            self.process.start()
+            
+            logger.info(f"✅ TTS worker process started (PID: {self.process.pid})")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to start TTS worker process: {e}")
+            self.process = None
+    
+    def _is_process_healthy(self):
+        """Check if the worker process is healthy"""
+        return self.process is not None and self.process.is_alive()
+    
+    def _restart_process(self):
+        """Restart the worker process if it fails"""
+        logger.warning("🔄 Restarting TTS worker process...")
+        
+        # Clean up old process
+        if self.process:
+            try:
+                self.process.terminate()
+                self.process.join(timeout=5)
+                if self.process.is_alive():
+                    self.process.kill()
+            except:
+                pass
+        
+        # Clear queues
+        try:
+            while not self.input_queue.empty():
+                self.input_queue.get_nowait()
+        except:
+            pass
+        try:
+            while not self.output_queue.empty():
+                self.output_queue.get_nowait()
+        except:
+            pass
+        
+        # Start new process
+        time.sleep(1)  # Brief delay before restart
+        self._start_worker()
+    
+    async def synthesize(self, text, voice="af", force_fallback=False, timeout=30):
+        """
+        Synthesize text to speech using isolated process
+        
+        Args:
+            text (str): Text to synthesize
+            voice (str): Voice to use
+            force_fallback (bool): Force use of espeak
+            timeout (float): Timeout in seconds
+            
+        Returns:
+            tuple: (audio_data, sample_rate)
+        """
+        if not text.strip():
+            logger.warning("Empty text provided for TTS")
+            return np.array([]), 24000
+        
+        # Try isolated process first
+        for attempt in range(self.max_retries):
+            if not self._is_process_healthy():
+                logger.warning(f"TTS process unhealthy, restarting (attempt {attempt + 1})")
+                self._restart_process()
+                
+                if not self._is_process_healthy():
+                    logger.error("Failed to restart TTS process, using fallback")
+                    break
+            
+            try:
+                # Create job
+                job_id = self.job_counter
+                self.job_counter += 1
+                
+                job = {
+                    "id": job_id,
+                    "text": text,
+                    "voice": voice,
+                    "force_fallback": force_fallback
+                }
+                
+                # Send job to worker
+                self.input_queue.put(job, timeout=5)
+                self.pending_jobs[job_id] = time.time()
+                
+                # Wait for result
+                start_time = time.time()
+                while time.time() - start_time < timeout:
+                    try:
+                        result = self.output_queue.get(timeout=1)
+                        if result["id"] == job_id:
+                            # Clean up
+                            if job_id in self.pending_jobs:
+                                del self.pending_jobs[job_id]
+                            
+                            if result["success"]:
+                                # Convert bytes back to numpy array
+                                audio_bytes = result["audio"]
+                                audio_array = np.frombuffer(audio_bytes, dtype=np.float32)
+                                logger.debug(f"✅ TTS synthesis successful via isolated process ({result['duration']:.2f}s)")
+                                return audio_array, result["sample_rate"]
+                            else:
+                                logger.error(f"TTS worker error: {result.get('error', 'Unknown error')}")
+                                break
+                                
+                    except queue.Empty:
+                        continue
+                
+                # Timeout or error occurred
+                logger.warning(f"TTS synthesis timeout/error (attempt {attempt + 1})")
+                if job_id in self.pending_jobs:
+                    del self.pending_jobs[job_id]
+                    
+            except Exception as e:
+                logger.error(f"TTS synthesis error (attempt {attempt + 1}): {e}")
+        
+        # All attempts failed - use fallback
+        logger.warning("🔄 TTS process isolation failed, using in-process fallback")
+        try:
+            return self.fallback_tts.synthesize(text, voice, force_fallback=True)
+        except Exception as e:
+            logger.error(f"Fallback TTS also failed: {e}")
+            return np.zeros(8000, dtype=np.float32), 24000
+    
+    def cleanup(self):
+        """Clean up the isolated process"""
+        logger.info("🧹 Cleaning up TTS isolated process...")
+        
+        if self.process and self.process.is_alive():
+            try:
+                # Send shutdown signal
+                self.input_queue.put(None, timeout=2)
+                
+                # Wait for graceful shutdown
+                self.process.join(timeout=5)
+                
+                if self.process.is_alive():
+                    logger.warning("TTS process did not shut down gracefully, terminating")
+                    self.process.terminate()
+                    self.process.join(timeout=3)
+                    
+                if self.process.is_alive():
+                    logger.warning("TTS process still alive, killing")
+                    self.process.kill()
+                    
+            except Exception as e:
+                logger.error(f"Error during TTS cleanup: {e}")
+        
+        # Clean up fallback
+        if hasattr(self, 'fallback_tts'):
+            self.fallback_tts.cleanup()
+        
+        logger.info("✅ TTS isolated process cleaned up")

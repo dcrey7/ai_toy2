@@ -3,6 +3,7 @@
 AI Voice Assistant - v2.2 (Streaming VAD & UI Logging)
 """
 
+# Set CUDA environment variables BEFORE any torch imports
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -21,6 +22,7 @@ import numpy as np
 import datetime
 import re
 import io
+import torch
 from pydub import AudioSegment
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
@@ -32,7 +34,7 @@ import uvicorn
 
 sys.path.append(str(Path(__file__).parent / "backend"))
 from services.kyutai_service import KyutaiSTTService
-from services.tts_service import LocalTTSService
+from services.tts_service import LocalTTSService, IsolatedTTSService
 from services.ollama_service import OllamaService
 from services.smart_turn_vad import SmartTurnVADService
 
@@ -333,25 +335,81 @@ class LLMAgent(Agent):
                 await self.app.comms_out_queue.put({"type": "status", "component": "llm", "status": "🟡 Thinking...", "websocket": ws})
                 await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": f"🤖 LLM Agent processing: '{text}' (source: {source})", "websocket": ws})
                 
-                response_text = await self.app.llm_service.generate_response(text, context=self.app.conversation_history)
+                # Start streaming response
+                full_response = ""
+                speech_chunks = []  # Collect complete sentences for TTS
                 
+                await self.app.comms_out_queue.put({"type": "streaming_start", "websocket": ws})
+                
+                async for chunk in self.app.llm_service.generate_streaming_response(text, context=self.app.conversation_history):
+                    if chunk["type"] == "sentence":
+                        content = chunk["content"]
+                        full_response += content + " "
+                        speech_chunks.append(content)
+                        
+                        # Send sentence immediately to frontend
+                        await self.app.comms_out_queue.put({
+                            "type": "streaming_chunk", 
+                            "text": content, 
+                            "websocket": ws
+                        })
+                        
+                        # For voice mode, collect sentences for sequential TTS processing (disabled parallel to prevent overlap)
+                        # if source == "voice" and len(content.strip()) > 15:  # Only meaningful sentences
+                        #     await self.app.tts_in_queue.put({
+                        #         "text": content, 
+                        #         "websocket": ws, 
+                        #         "is_streaming": True
+                        #     })
+                    
+                    elif chunk["type"] == "partial":
+                        content = chunk["content"]
+                        full_response += content + " "
+                        
+                        # Send partial content for immediate display
+                        await self.app.comms_out_queue.put({
+                            "type": "streaming_chunk", 
+                            "text": content, 
+                            "websocket": ws
+                        })
+                    
+                    elif chunk["type"] == "complete":
+                        await self.app.comms_out_queue.put({"type": "streaming_complete", "websocket": ws})
+                        break
+                        
+                    elif chunk["type"] == "error":
+                        full_response = chunk["content"]
+                        await self.app.comms_out_queue.put({
+                            "type": "streaming_chunk", 
+                            "text": full_response, 
+                            "websocket": ws
+                        })
+                        await self.app.comms_out_queue.put({"type": "streaming_complete", "websocket": ws})
+                        break
+                
+                # Update conversation history
                 self.app.conversation_history.append({"role": "user", "content": text})
-                self.app.conversation_history.append({"role": "assistant", "content": response_text})
+                self.app.conversation_history.append({"role": "assistant", "content": full_response.strip()})
                 self.app.conversation_history = self.app.conversation_history[-20:]
                 
-                await self.app.comms_out_queue.put({"type": "log", "level": "success", "message": f"✅ LLM generated response: '{response_text[:100]}...'", "websocket": ws})
-                await self.app.comms_out_queue.put({"type": "response", "text": response_text, "websocket": ws})
+                await self.app.comms_out_queue.put({"type": "log", "level": "success", "message": f"✅ LLM streaming complete: '{full_response[:100]}...'", "websocket": ws})
                 
-                # Only synthesize speech if the original input was voice
-                if source == "voice":
-                    await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": "🎵 Sending LLM response to TTS for voice synthesis", "websocket": ws})
-                    await self.app.tts_in_queue.put({"text": response_text, "websocket": ws})
+                # Log completion and process TTS sequentially for voice mode
+                if source != "voice":
+                    await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": "📝 Text mode - streaming complete, skipping TTS synthesis", "websocket": ws})
                 else:
-                    await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": "📝 Text mode - skipping TTS synthesis", "websocket": ws})
+                    # Send complete response to TTS as single chunk to avoid overlapping
+                    await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": f"🎵 Sending complete response to TTS (sequential processing)", "websocket": ws})
+                    await self.app.tts_in_queue.put({
+                        "text": full_response.strip(), 
+                        "websocket": ws, 
+                        "is_streaming": False
+                    })
                     
             except Exception as e:
                 logger.error(f"LLMAgent error: {e}")
                 await self.app.comms_out_queue.put({"type": "log", "level": "error", "message": f"❌ LLM Error: {e}", "websocket": ws})
+                await self.app.comms_out_queue.put({"type": "streaming_complete", "websocket": ws})
             finally:
                 await self.app.comms_out_queue.put({"type": "status", "component": "llm", "status": "🟢 Ready", "websocket": ws})
 
@@ -362,29 +420,57 @@ class TTSAgent(Agent):
             ws, text = job["websocket"], job["text"]
             use_fallback = job.get("use_fallback", False)
             is_greeting = job.get("is_greeting", False)
+            is_streaming = job.get("is_streaming", False)
             try:
                 await self.app.comms_out_queue.put({"type": "status", "component": "tts", "status": "🟡 Speaking...", "websocket": ws})
-                await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": f"🎵 TTS Agent processing: '{text[:50]}...' (fallback={use_fallback})", "websocket": ws})
+                
+                # Log different messages for streaming vs batch TTS
+                if is_streaming:
+                    await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": f"🎵 TTS Agent (streaming): '{text[:50]}...'", "websocket": ws})
+                else:
+                    await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": f"🎵 TTS Agent processing: '{text[:50]}...' (fallback={use_fallback})", "websocket": ws})
                 
                 # Sanitize text for TTS to avoid phonemizer errors with markdown
                 sanitized_text = re.sub(r'[*`#_]', '', text)
 
-                engine_name = "espeak" if use_fallback else self.app.tts_service.primary_engine
-                await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": f"🔊 Using TTS engine: {engine_name}", "websocket": ws})
-                
-                audio_data, sample_rate = self.app.tts_service.synthesize(sanitized_text, voice="af_heart", force_fallback=use_fallback)
+                # Use isolated TTS service if available, otherwise fallback to direct service
+                if hasattr(self.app, 'isolated_tts_service') and self.app.isolated_tts_service:
+                    await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": "🔒 Using isolated TTS process", "websocket": ws})
+                    audio_data, sample_rate = await self.app.isolated_tts_service.synthesize(
+                        sanitized_text, 
+                        voice="af_heart", 
+                        force_fallback=use_fallback
+                    )
+                else:
+                    # Fallback to direct TTS service
+                    engine_name = "espeak" if use_fallback else self.app.tts_service.primary_engine
+                    await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": f"🔊 Using direct TTS engine: {engine_name}", "websocket": ws})
+                    audio_data, sample_rate = self.app.tts_service.synthesize(sanitized_text, voice="af_heart", force_fallback=use_fallback)
                 
                 if audio_data is not None and len(audio_data) > 0:
-                    await self.app.comms_out_queue.put({"type": "log", "level": "success", "message": f"✅ TTS generated {len(audio_data)} audio samples at {sample_rate}Hz", "websocket": ws})
-                    audio_b64 = base64.b64encode((audio_data * 32767).astype(np.int16).tobytes()).decode('utf-8')
-                    await self.app.comms_out_queue.put({"type": "tts_audio", "audio": audio_b64, "sample_rate": sample_rate, "text": text, "websocket": ws})
+                    duration = len(audio_data) / sample_rate
+                    await self.app.comms_out_queue.put({"type": "log", "level": "success", "message": f"✅ TTS generated {len(audio_data)} samples ({duration:.1f}s) at {sample_rate}Hz", "websocket": ws})
                     
-                    # TTS completed successfully 
+                    # Convert to int16 and encode as base64
+                    audio_b64 = base64.b64encode((audio_data * 32767).astype(np.int16).tobytes()).decode('utf-8')
+                    await self.app.comms_out_queue.put({
+                        "type": "tts_audio", 
+                        "audio": audio_b64, 
+                        "sample_rate": sample_rate, 
+                        "text": text, 
+                        "is_streaming": is_streaming,
+                        "websocket": ws
+                    })
+                    
+                    # Handle different post-TTS behaviors
                     if is_greeting:
                         # After greeting TTS finishes, start VAD listening with a brief delay
                         await asyncio.sleep(1.0)  # Wait 1 second after greeting ends
                         await self.app.comms_out_queue.put({"type": "vad_status", "status": "inactive", "websocket": ws})
                         await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": "🎤 Greeting finished - Smart Turn v2 VAD now listening for your voice", "websocket": ws})
+                    elif is_streaming:
+                        # For streaming TTS, just log completion
+                        await self.app.comms_out_queue.put({"type": "log", "level": "debug", "message": f"🎵 Streaming TTS chunk completed: '{text[:30]}...'", "websocket": ws})
                     # Smart Turn v2 handles turn detection automatically for all other responses
                 else:
                     await self.app.comms_out_queue.put({"type": "log", "level": "warning", "message": "⚠️ TTS returned no audio data", "websocket": ws})
@@ -436,6 +522,7 @@ class VoiceAssistant:
         self.stt_service: Optional[KyutaiSTTService] = None
         self.llm_service: Optional[OllamaService] = None
         self.tts_service: Optional[LocalTTSService] = None
+        self.isolated_tts_service: Optional[IsolatedTTSService] = None
         self.agents: List[Agent] = []
 
     async def load_config(self):
@@ -449,15 +536,65 @@ class VoiceAssistant:
             sys.exit(1)
 
     async def initialize_services(self):
-        stt_config = self.config['models']['stt']
-        self.stt_service = KyutaiSTTService(
-            model_name=stt_config['model_name'],
-            device=stt_config['device']
-        )
-        llm_config = self.config['models']['llm']
-        self.llm_service = OllamaService(base_url=llm_config['base_url'], model_name=llm_config['model_name'])
-        tts_config = self.config['models']['tts']
-        self.tts_service = LocalTTSService(primary_engine=tts_config['primary'], device=tts_config.get('device', 'cuda'))
+        logger.info("🚀 Initializing AI services with GPU optimization...")
+        
+        # Configure multiprocessing for CUDA compatibility
+        import torch.multiprocessing as mp
+        try:
+            if mp.get_start_method(allow_none=True) != 'spawn':
+                mp.set_start_method('spawn', force=True)
+                logger.info("✅ Set multiprocessing start method to 'spawn' for CUDA compatibility")
+        except RuntimeError as e:
+            logger.info(f"Multiprocessing context already set: {e}")
+        
+        # Initialize CUDA context properly
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            logger.info(f"✅ CUDA initialized - GPU: {torch.cuda.get_device_name(0)}")
+        else:
+            logger.warning("⚠️ CUDA not available, models will run on CPU")
+        
+        # Initialize services sequentially to avoid CUDA conflicts
+        try:
+            # 1. Initialize LLM service (Ollama) first - most important for GPU
+            logger.info("📡 Initializing LLM service (Ollama)...")
+            llm_config = self.config['models']['llm']
+            self.llm_service = OllamaService(base_url=llm_config['base_url'], model_name=llm_config['model_name'])
+            
+            # 2. Initialize STT service
+            logger.info("🎤 Initializing STT service...")
+            stt_config = self.config['models']['stt']
+            self.stt_service = KyutaiSTTService(
+                model_name=stt_config['model_name'],
+                device=stt_config['device']
+            )
+            
+            # Clear cache after STT loading
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # 3. Initialize direct TTS service (lighter load first)
+            logger.info("🔊 Initializing TTS service...")
+            tts_config = self.config['models']['tts']
+            self.tts_service = LocalTTSService(primary_engine=tts_config['primary'], device=tts_config.get('device', 'cuda'))
+            
+            # Clear cache after TTS loading
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # 4. Initialize isolated TTS service for better CUDA memory management
+            try:
+                logger.info("🔄 Initializing isolated TTS service...")
+                self.isolated_tts_service = IsolatedTTSService()
+                logger.info("✅ Isolated TTS service initialized successfully")
+            except Exception as e:
+                logger.warning(f"⚠️ Isolated TTS service failed to initialize: {e}")
+                logger.info("🔄 Falling back to direct TTS service")
+                self.isolated_tts_service = None
+                
+        except Exception as e:
+            logger.error(f"❌ Service initialization failed: {e}")
+            raise
 
     def initialize_agents(self):
         self.agents = [STTAgent(self), LLMAgent(self), TTSAgent(self), CommsAgent(self), LogAgent(self, self.log_queue)]
@@ -486,6 +623,7 @@ class VoiceAssistant:
         for agent in self.agents: await agent.stop()
         if self.stt_service: self.stt_service.cleanup()
         if self.tts_service: self.tts_service.cleanup()
+        if self.isolated_tts_service: self.isolated_tts_service.cleanup()
         if self.llm_service: await self.llm_service.cleanup()
 
 async def main():

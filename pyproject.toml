@@ -27,4 +27,5 @@ dependencies = [
     "uvicorn[standard]>=0.24.0",
     "numba>=0.61.2",
     "pip>=25.2",
+    "nltk>=3.8.0",
 ]

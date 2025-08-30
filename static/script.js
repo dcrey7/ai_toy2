@@ -32,12 +32,31 @@ class VoiceAssistant {
     setupUI() {
         const controlsHTML = `
             <div class="voice-controls-section">
-                <div class="status-indicator"><div class="status-dot" id="connectionDot"></div><span id="connectionStatus">Connecting...</span></div>
+                <div class="status-indicator">
+                    🎥 Live<br>
+                    <div class="status-dot" id="connectionDot"></div><span id="connectionStatus">Connecting...</span>
+                </div>
                 <div class="system-status">
-                    <div class="status-item"><span class="status-label">STT:</span><span class="status-value" id="sttStatus">⚪ Loading</span></div>
-                    <div class="status-item"><span class="status-label">LLM:</span><span class="status-value" id="llmStatus">⚪ Loading</span></div>
-                    <div class="status-item"><span class="status-label">TTS:</span><span class="status-value" id="ttsStatus">⚪ Loading</span></div>
-                    <div class="status-item"><span class="status-label">GPU:</span><span class="status-value" id="gpuStatus">⚪ Loading</span></div>
+                    <div class="status-item">
+                        STT:<br>
+                        <span class="status-value" id="sttStatus">🟢 Ready<br><small>Kyutai STT-1B</small></span>
+                    </div>
+                    <div class="status-item">
+                        LLM:<br>
+                        <span class="status-value" id="llmStatus">🟢 Ready<br><small>Gemma3:1B</small></span>
+                    </div>
+                    <div class="status-item">
+                        TTS:<br>
+                        <span class="status-value" id="ttsStatus">🟢 Ready<br><small>Kokoro TTS</small></span>
+                    </div>
+                    <div class="status-item">
+                        GPU:<br>
+                        <span class="status-value" id="gpuStatus">🟢 Ready<br><small>RTX 3050 6GB</small></span>
+                    </div>
+                    <div class="status-item">
+                        VAD:<br>
+                        <span class="status-value" id="vadSystemStatus">🟢 Ready<br><small>Smart Turn v2</small></span>
+                    </div>
                 </div>
                 <div class="mode-toggle">
                     <button id="textModeBtn" class="mode-button active">💬 Text Chat</button>
@@ -80,7 +99,15 @@ class VoiceAssistant {
             const message = JSON.parse(data);
             switch (message.type) {
                 case 'transcript': this.addMessage('user', message.text); break;
-                case 'response': this.addMessage('assistant', message.text); break;
+                case 'response': 
+                    // Only handle non-streaming responses (fallback compatibility)
+                    if (!this.currentStreamingMessage) {
+                        this.addMessage('assistant', message.text); 
+                    }
+                    break;
+                case 'streaming_start': this.startStreamingMessage('assistant'); break;
+                case 'streaming_chunk': this.appendToStreamingMessage(message.text); break;
+                case 'streaming_complete': this.completeStreamingMessage(); break;
                 case 'status': this.updateSystemStatus(message.component, message.status); break;
                 case 'vad_status': this.updateVadStatus(message.status); break;
                 case 'recording_control': this.handleRecordingControl(message); break;
@@ -321,9 +348,54 @@ class VoiceAssistant {
         this.connectionDot.className = `status-dot ${className}`;
     }
     
-    updateSystemStatus(component, status) {
+    updateSystemStatus(component, status, modelName = '') {
         const statusElement = document.getElementById(`${component}Status`);
-        if (statusElement) statusElement.textContent = status;
+        if (!statusElement) return;
+        
+        let statusIcon = '🟢';
+        let statusText = 'Ready';
+        let fullModelName = modelName;
+        
+        // Set status icon based on status
+        switch (status) {
+            case 'ready':
+                statusIcon = '🟢';
+                statusText = 'Ready';
+                break;
+            case 'working':
+            case 'processing':
+                statusIcon = '🟡';
+                statusText = 'Working';
+                break;
+            case 'error':
+                statusIcon = '🔴';
+                statusText = 'Error';
+                break;
+            default:
+                statusIcon = '⚪';
+                statusText = status;
+        }
+        
+        // Set model names for different components
+        switch (component) {
+            case 'stt':
+                fullModelName = fullModelName || 'Kyutai STT-1B';
+                break;
+            case 'llm':
+                fullModelName = fullModelName || 'Gemma3:1B';
+                break;
+            case 'tts':
+                fullModelName = fullModelName || 'Kokoro TTS';
+                break;
+            case 'gpu':
+                fullModelName = fullModelName || 'NVIDIA GeForce RTX 3050 6GB Laptop GPU';
+                break;
+            case 'vadSystem':
+                fullModelName = fullModelName || 'Smart Turn v2 VAD';
+                break;
+        }
+        
+        statusElement.innerHTML = `${statusIcon} ${statusText}${fullModelName ? '<br><small>' + fullModelName + '</small>' : ''}`;
     }
 
     updateVadStatus(status) {
@@ -362,6 +434,80 @@ class VoiceAssistant {
         messageDiv.appendChild(contentDiv);
         messageDiv.appendChild(timeDiv);
         this.chatMessages.appendChild(messageDiv);
+        this.chatMessages.scrollTop = this.chatMessages.scrollHeight;
+    }
+    
+    startStreamingMessage(type) {
+        // Create a new streaming message container
+        this.currentStreamingMessage = document.createElement('div');
+        this.currentStreamingMessage.className = `message ${type} streaming`;
+        
+        this.streamingContentDiv = document.createElement('div');
+        this.streamingContentDiv.className = 'streaming-content';
+        
+        // Add a typing indicator
+        const typingIndicator = document.createElement('span');
+        typingIndicator.className = 'typing-indicator';
+        typingIndicator.textContent = '▋';
+        this.streamingContentDiv.appendChild(typingIndicator);
+        
+        this.currentStreamingMessage.appendChild(this.streamingContentDiv);
+        this.chatMessages.appendChild(this.currentStreamingMessage);
+        this.chatMessages.scrollTop = this.chatMessages.scrollHeight;
+        
+        // Store reference to typing indicator for removal later
+        this.typingIndicator = typingIndicator;
+    }
+    
+    appendToStreamingMessage(text) {
+        if (!this.currentStreamingMessage || !this.streamingContentDiv) {
+            window.logger.warning('No active streaming message to append to');
+            return;
+        }
+        
+        // Remove typing indicator temporarily
+        if (this.typingIndicator && this.typingIndicator.parentNode) {
+            this.typingIndicator.parentNode.removeChild(this.typingIndicator);
+        }
+        
+        // Append new text
+        const textSpan = document.createElement('span');
+        textSpan.textContent = text + ' ';
+        this.streamingContentDiv.appendChild(textSpan);
+        
+        // Add typing indicator back
+        this.streamingContentDiv.appendChild(this.typingIndicator);
+        
+        // Smooth scroll to bottom
+        this.chatMessages.scrollTop = this.chatMessages.scrollHeight;
+    }
+    
+    completeStreamingMessage() {
+        if (!this.currentStreamingMessage || !this.streamingContentDiv) {
+            window.logger.warning('No active streaming message to complete');
+            return;
+        }
+        
+        // Remove typing indicator
+        if (this.typingIndicator && this.typingIndicator.parentNode) {
+            this.typingIndicator.parentNode.removeChild(this.typingIndicator);
+        }
+        
+        // Remove streaming class to finalize styling
+        this.currentStreamingMessage.classList.remove('streaming');
+        
+        // Add timestamp
+        const timeDiv = document.createElement('div');
+        timeDiv.className = 'timestamp';
+        timeDiv.textContent = new Date().toLocaleTimeString();
+        this.currentStreamingMessage.appendChild(timeDiv);
+        
+        // Clear references
+        this.currentStreamingMessage = null;
+        this.streamingContentDiv = null;
+        this.typingIndicator = null;
+        
+        // Final scroll
         this.chatMessages.scrollTop = this.chatMessages.scrollHeight;
     }
     

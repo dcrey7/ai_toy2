@@ -16,7 +16,7 @@ from collections import deque
 logger = logging.getLogger(__name__)
 
 class SmartTurnVADService:
-    def __init__(self, model_name="pipecat-ai/smart-turn-v2", device="cuda", buffer_duration=8.0, max_speech_duration=30.0):
+    def __init__(self, model_name="pipecat-ai/smart-turn-v2", device="cuda", buffer_duration=8.0, max_speech_duration=15.0):
         self.model_name = model_name
         self.device = device if device == "cuda" and torch.cuda.is_available() else "cpu"
         self.buffer_duration = buffer_duration  # Smart Turn v2 analyzes 8s windows
@@ -34,18 +34,18 @@ class SmartTurnVADService:
         # VAD pipeline
         self.vad_pipeline: Optional[pipeline] = None
         self.last_turn_check = 0
-        self.turn_check_interval = 0.2  # Check every 200ms for faster responsiveness  
-        self.confidence_threshold = 0.35  # Optimized threshold for accuracy vs speed
+        self.turn_check_interval = 0.2  # Check every 200ms (faster response)
+        self.confidence_threshold = 0.3  # Lower threshold for faster detection
         
         # State tracking
         self.is_processing = False
         self.consecutive_complete_detections = 0
-        self.required_consecutive_detections = 1  # Only need 1 detection for faster response
+        self.required_consecutive_detections = 2  # Need 2 consecutive detections for stability
         
         # Fallback mechanism
         self.speech_start_time = None
         self.max_speech_duration = max_speech_duration  # Configurable max speech duration
-        self.silence_timeout = 3.0  # Complete after 3 seconds of silence (more forgiving)
+        self.silence_timeout = 4.0  # Complete after 4 seconds of silence (more forgiving)
         
         self._load_model()
 
@@ -139,10 +139,10 @@ class SmartTurnVADService:
         # Get current VAD buffer (recent 8s window for analysis)
         audio_data = self.get_vad_audio()
         
-        # Need at least 1.5 seconds of audio for meaningful analysis
-        min_samples = int(1.5 * self.sample_rate)
+        # Need at least 2.0 seconds of audio for meaningful analysis (faster response)
+        min_samples = int(2.0 * self.sample_rate)
         if len(audio_data) < min_samples:
-            return False, 0.0, f"Insufficient audio: {len(audio_data)/self.sample_rate:.1f}s < 1.5s"
+            return False, 0.0, f"Insufficient audio: {len(audio_data)/self.sample_rate:.1f}s < 2.0s"
         
         # Fallback: Force completion after max speech duration with progressive warnings
         if self.speech_start_time:
@@ -171,14 +171,15 @@ class SmartTurnVADService:
             # Run Smart Turn v2 VAD
             result = self.vad_pipeline(audio_data, top_k=None)[0]
             
-            is_complete = result['label'] == 'complete'
+            # Smart Turn v2 uses LABEL_1 for complete, LABEL_0 for incomplete
+            is_complete = result['label'] == 'LABEL_1'
             confidence = result['score']
             
             # Log all VAD results for debugging
             logger.info(f"🔍 VAD Analysis: label='{result['label']}', confidence={confidence:.3f}, threshold={self.confidence_threshold}, audio={len(audio_data)/self.sample_rate:.1f}s")
             
-            # More permissive detection - accept either "complete" or high confidence on any label
-            if (is_complete and confidence >= self.confidence_threshold) or confidence >= 0.7:
+            # More conservative detection - require higher confidence for completion
+            if is_complete and confidence >= self.confidence_threshold:
                 self.consecutive_complete_detections += 1
                 if self.consecutive_complete_detections >= self.required_consecutive_detections:
                     logger.info(f"🎯 Turn COMPLETE detected! (label: {result['label']}, confidence: {confidence:.3f})")

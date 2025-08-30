@@ -11,13 +11,13 @@ models:
   # LLM Model (Your existing Ollama)
   llm:
     base_url: "http://localhost:11434"
-    model_name: "gemma3:4b"  # Using 1B model for optimal VRAM usage (was 4b)
+    model_name: "gemma3:1b"  # Using 1B model for optimal VRAM usage (was 4b)
     # Alternative: "mistral:latest" if you want to try your other model
     
   # TTS Model
   tts:
     primary: "kokoro"  # Use high-quality TTS
-    device: "cuda"     # Specify device for Kokoro
+    device: "cuda"     # Use GPU for performance
     fallback: "espeak" # Fallback if Kokoro fails
     
   # Vision Model (Same as conversation for simplicity)

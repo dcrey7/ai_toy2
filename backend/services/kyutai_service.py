@@ -28,6 +28,11 @@ class KyutaiSTTService:
         try:
             logger.info(f"Loading Kyutai STT model {self.model_name} on device {self.device}")
             
+            # Clear CUDA cache before loading
+            if self.device == "cuda" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                logger.info("Cleared CUDA cache before model loading")
+            
             # Load processor and model separately using the dedicated Kyutai classes
             self.processor = KyutaiSpeechToTextProcessor.from_pretrained(
                 self.model_name,
@@ -37,7 +42,19 @@ class KyutaiSTTService:
             self.model = KyutaiSpeechToTextForConditionalGeneration.from_pretrained(
                 self.model_name,
                 torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
-            ).to(self.torch_device)
+            )
+            
+            # Try to move to device with fallback to CPU
+            try:
+                self.model = self.model.to(self.torch_device)
+                logger.info(f"✅ Model successfully moved to {self.device}")
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as cuda_err:
+                logger.warning(f"⚠️ CUDA device busy/unavailable: {cuda_err}")
+                logger.info("🔄 Falling back to CPU device")
+                self.device = "cpu"
+                self.torch_device = torch.device("cpu")
+                self.model = self.model.to(self.torch_device)
+                logger.info("✅ Model successfully moved to CPU")
             
             # Set model to evaluation mode
             self.model.eval()

@@ -169,6 +169,32 @@ body {
     box-shadow: 0 2px 5px rgba(0,0,0,0.1);
 }
 
+.message.streaming {
+    border: 2px solid #667eea;
+    background: linear-gradient(135deg, #f8f9ff 0%, #ffffff 100%);
+    animation: streamingPulse 2s ease-in-out infinite;
+}
+
+.streaming-content {
+    position: relative;
+}
+
+.typing-indicator {
+    color: #667eea;
+    font-weight: bold;
+    animation: typingBlink 1s infinite;
+}
+
+@keyframes streamingPulse {
+    0%, 100% { box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+    50% { box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3); }
+}
+
+@keyframes typingBlink {
+    0%, 50% { opacity: 1; }
+    51%, 100% { opacity: 0.3; }
+}
+
 .message.vision {
     border-left: 4px solid #667eea;
     background: linear-gradient(135deg, #e3f2fd 0%, #f3e5f5 100%);
