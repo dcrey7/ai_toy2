@@ -8,6 +8,19 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 
+# Fix CUDA initialization issues
+try:
+    import torch
+    # Clear CUDA cache and reset
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        # Test CUDA availability
+        device = torch.cuda.current_device()
+        print(f"CUDA Device: {torch.cuda.get_device_name(device)}")
+except Exception as e:
+    print(f"CUDA setup warning: {e}")
+
 import asyncio
 import json
 import logging
@@ -22,7 +35,6 @@ import numpy as np
 import datetime
 import re
 import io
-import torch
 from pydub import AudioSegment
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
@@ -37,6 +49,9 @@ from services.kyutai_service import KyutaiSTTService
 from services.tts_service import LocalTTSService, IsolatedTTSService
 from services.ollama_service import OllamaService
 from services.smart_turn_vad import SmartTurnVADService
+from services.metrics_service import metrics_collector
+from services.metrics_api import metrics_api
+from services.metrics_export import metrics_exporter
 
 # Setup root logger
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -114,10 +129,19 @@ class WebSocketAgent(Agent):
                         # Temporarily disable audio streaming to prevent feedback
                         self.is_streaming_audio = False
                         
+                        # Use existing VAD session if available, otherwise start new response
+                        if hasattr(self, '_current_vad_session_id'):
+                            response_id = self._current_vad_session_id
+                            delattr(self, '_current_vad_session_id')  # Clear session
+                        else:
+                            response_id = metrics_collector.start_response(self.client_id, mode="voice")
+                        
+                        metrics_collector.mark_vad_complete(response_id)
+                        
                         await self.app.comms_out_queue.put({
                             "type": "log",
                             "level": "success",
-                            "message": f"🎯 Turn complete detected (confidence: {confidence:.3f})",
+                            "message": f"🎯 Turn complete detected (confidence: {confidence:.3f}) [Response: {response_id}]",
                             "websocket": self.websocket
                         })
                         
@@ -135,13 +159,15 @@ class WebSocketAgent(Agent):
                                 "audio_data": audio_buffer,
                                 "websocket": self.websocket,
                                 "source": "smart_turn_vad",
-                                "sample_rate": 16000
+                                "sample_rate": 16000,
+                                "response_id": response_id  # Pass response_id for metrics
                             })
                             
                             # Clear buffer after sending to STT
                             self.vad_service.clear_buffer()
                         else:
                             logger.warning("⚠️ No audio buffer available for STT")
+                            metrics_collector.add_error(response_id, "No audio buffer available")
                         
                         # Wait before re-enabling to prevent immediate feedback
                         await asyncio.sleep(2.0)
@@ -177,11 +203,12 @@ class WebSocketAgent(Agent):
             try:
                 import torch
                 if torch.cuda.is_available():
-                    await self.app.comms_out_queue.put({"type": "status", "component": "gpu", "status": f"🟢 {torch.cuda.get_device_name(0)}", "websocket": self.websocket})
+                    gpu_name = torch.cuda.get_device_name(0)
+                    await self.app.comms_out_queue.put({"type": "status", "component": "gpu", "status": f"🟢 {gpu_name}", "websocket": self.websocket})
                 else:
                     await self.app.comms_out_queue.put({"type": "status", "component": "gpu", "status": "⚪ CPU Only", "websocket": self.websocket})
-            except ImportError:
-                await self.app.comms_out_queue.put({"type": "status", "component": "gpu", "status": "⚪ N/A", "websocket": self.websocket})
+            except Exception as e:
+                await self.app.comms_out_queue.put({"type": "status", "component": "gpu", "status": "❌ GPU Error", "websocket": self.websocket})
 
             while True:
                 message = json.loads(await self.websocket.receive_text())
@@ -225,6 +252,18 @@ class WebSocketAgent(Agent):
                             pcm_bytes = base64.b64decode(pcm_b64)
                             pcm_array = np.frombuffer(pcm_bytes, dtype=np.int16)
                             
+                            # Check if this is the start of speech (VAD start)
+                            if not hasattr(self, '_current_vad_session_id'):
+                                # Start new VAD session
+                                self._current_vad_session_id = metrics_collector.start_response(self.client_id, mode="voice")
+                                metrics_collector.mark_vad_start(self._current_vad_session_id)
+                                await self.app.comms_out_queue.put({
+                                    "type": "log", 
+                                    "level": "info", 
+                                    "message": f"🎤 VAD session started [Response: {self._current_vad_session_id}]",
+                                    "websocket": self.websocket
+                                })
+                            
                             # Add to VAD service buffer
                             self.vad_service.add_pcm_chunk(pcm_array)
                             
@@ -237,8 +276,42 @@ class WebSocketAgent(Agent):
 
                 elif msg_type == 'text_message':
                     user_text = message.get("text")
-                    await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": f"💬 Text message received: '{user_text}'", "websocket": self.websocket})
-                    await self.app.llm_in_queue.put({"text": user_text, "websocket": self.websocket, "source": "text"})
+                    # Start metrics tracking for text response
+                    response_id = metrics_collector.start_response(self.client_id, mode="text")
+                    await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": f"💬 Text message received: '{user_text}' [Response: {response_id}]", "websocket": self.websocket})
+                    await self.app.llm_in_queue.put({"text": user_text, "websocket": self.websocket, "source": "text", "response_id": response_id})
+                
+                elif msg_type == 'metrics_request':
+                    # Handle metrics API requests
+                    response = await metrics_api.handle_metrics_request(message, self.websocket)
+                    if response:
+                        await self.app.comms_out_queue.put(response)
+                
+                elif msg_type == 'start_live_metrics':
+                    # Start live metrics streaming
+                    interval = message.get("interval", 2.0)
+                    asyncio.create_task(metrics_api.start_live_metrics_stream(self.websocket, interval))
+                    await self.app.comms_out_queue.put({
+                        "type": "log", 
+                        "level": "info", 
+                        "message": f"📊 Started live metrics stream (interval: {interval}s)", 
+                        "websocket": self.websocket
+                    })
+                
+                elif msg_type == 'voice_timing_metrics':
+                    # Handle client-side voice timing metrics
+                    response_id = message.get("responseId")
+                    voice_to_voice_latency = message.get("voiceToVoiceLatency")
+                    
+                    if response_id and voice_to_voice_latency is not None:
+                        # Update metrics with client-side measurement
+                        metrics_collector.update_client_timing(response_id, voice_to_voice_latency)
+                        await self.app.comms_out_queue.put({
+                            "type": "log", 
+                            "level": "info", 
+                            "message": f"📊 Client voice-to-voice timing: {voice_to_voice_latency:.3f}s [Response: {response_id}]", 
+                            "websocket": self.websocket
+                        })
 
         except WebSocketDisconnect:
             logger.info(f"Client {self.client_id} disconnected.")
@@ -260,9 +333,14 @@ class STTAgent(Agent):
             audio_data = job.get("audio_data")
             source = job.get("source", "unknown")
             sample_rate = job.get("sample_rate", 16000)
+            response_id = job.get("response_id")  # Get response_id for metrics
             
             try:
-                await self.app.comms_out_queue.put({"type": "status", "component": "stt", "status": "🟡 Transcribing...", "websocket": ws})
+                # Mark STT start in metrics
+                if response_id:
+                    metrics_collector.mark_stt_start(response_id)
+                
+                await self.app.comms_out_queue.put({"type": "status", "component": "stt", "status": "working", "websocket": ws})
                 
                 if audio_data is None or (isinstance(audio_data, list) and len(audio_data) == 0):
                     raise Exception("No audio data received")
@@ -272,6 +350,7 @@ class STTAgent(Agent):
                     # Direct PCM data from Smart Turn v2 VAD (numpy array)
                     if isinstance(audio_data, np.ndarray):
                         samples = audio_data.astype(np.float32)
+                        await self.app.comms_out_queue.put({"type": "status", "component": "vadSystem", "status": "working", "websocket": ws})
                         await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": f"📝 Processing Smart Turn v2 VAD audio: {len(samples)} samples ({len(samples)/sample_rate:.1f}s)", "websocket": ws})
                     else:
                         raise Exception("Expected numpy array for Smart Turn v2 VAD data")
@@ -312,11 +391,19 @@ class STTAgent(Agent):
                     text = self.app.stt_service.transcribe(samples, sample_rate=sample_rate)
                 
                 if text and text.strip():
+                    # Mark STT completion in metrics
+                    if response_id:
+                        metrics_collector.mark_stt_complete(response_id, text)
+                    
                     await self.app.comms_out_queue.put({"type": "log", "level": "success", "message": f"✅ STT transcription: '{text}'", "websocket": ws})
+                    await self.app.comms_out_queue.put({"type": "status", "component": "stt", "status": "ready", "websocket": ws})
+                    await self.app.comms_out_queue.put({"type": "status", "component": "vadSystem", "status": "ready", "websocket": ws})
                     await self.app.comms_out_queue.put({"type": "transcript", "text": text, "is_final": True, "websocket": ws})
-                    await self.app.llm_in_queue.put({"text": text, "websocket": ws, "source": "voice"})
+                    await self.app.llm_in_queue.put({"text": text, "websocket": ws, "source": "voice", "response_id": response_id})
                 else:
                     await self.app.comms_out_queue.put({"type": "log", "level": "warning", "message": "⚠️ STT returned empty transcription - Smart Turn v2 continues listening", "websocket": ws})
+                    if response_id:
+                        metrics_collector.add_warning(response_id, "STT returned empty transcription")
                         
             except Exception as e:
                 logger.error(f"STTAgent error: {e}")
@@ -331,8 +418,14 @@ class LLMAgent(Agent):
         while True:
             job = await self.app.llm_in_queue.get()
             ws, text, source = job["websocket"], job["text"], job.get("source", "unknown")
+            response_id = job.get("response_id")  # Get response_id for metrics
+            
             try:
-                await self.app.comms_out_queue.put({"type": "status", "component": "llm", "status": "🟡 Thinking...", "websocket": ws})
+                # Mark LLM start in metrics
+                if response_id:
+                    metrics_collector.mark_llm_start(response_id)
+                
+                await self.app.comms_out_queue.put({"type": "status", "component": "llm", "status": "working", "websocket": ws})
                 await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": f"🤖 LLM Agent processing: '{text}' (source: {source})", "websocket": ws})
                 
                 # Start streaming response
@@ -341,11 +434,19 @@ class LLMAgent(Agent):
                 
                 await self.app.comms_out_queue.put({"type": "streaming_start", "websocket": ws})
                 
+                # Track first token timing
+                first_token_received = False
+                
                 async for chunk in self.app.llm_service.generate_streaming_response(text, context=self.app.conversation_history):
                     if chunk["type"] == "sentence":
                         content = chunk["content"]
                         full_response += content + " "
                         speech_chunks.append(content)
+                        
+                        # Mark first token for metrics
+                        if not first_token_received and response_id:
+                            metrics_collector.mark_llm_first_token(response_id)
+                            first_token_received = True
                         
                         # Send sentence immediately to frontend
                         await self.app.comms_out_queue.put({
@@ -387,23 +488,55 @@ class LLMAgent(Agent):
                         await self.app.comms_out_queue.put({"type": "streaming_complete", "websocket": ws})
                         break
                 
+                # Mark LLM completion in metrics with proper token counting
+                if response_id:
+                    # More accurate token count estimation (approximation: 1 token ≈ 0.75 words)
+                    word_count = len(full_response.split()) if full_response else 0
+                    token_count = int(word_count * 1.33)  # Convert words to approximate tokens
+                    
+                    # Add text quality metrics
+                    char_count = len(full_response.strip())
+                    sentence_count = full_response.count('.') + full_response.count('!') + full_response.count('?')
+                    
+                    metrics_collector.mark_llm_complete(response_id, full_response.strip(), token_count)
+                    
+                    # Add quality metrics
+                    metrics_collector.add_quality_metrics(response_id, {
+                        "word_count": word_count,
+                        "character_count": char_count,
+                        "sentence_count": max(sentence_count, 1),  # At least 1
+                        "avg_words_per_sentence": word_count / max(sentence_count, 1)
+                    })
+                
                 # Update conversation history
                 self.app.conversation_history.append({"role": "user", "content": text})
                 self.app.conversation_history.append({"role": "assistant", "content": full_response.strip()})
                 self.app.conversation_history = self.app.conversation_history[-20:]
                 
                 await self.app.comms_out_queue.put({"type": "log", "level": "success", "message": f"✅ LLM streaming complete: '{full_response[:100]}...'", "websocket": ws})
+                await self.app.comms_out_queue.put({"type": "status", "component": "llm", "status": "ready", "websocket": ws})
                 
                 # Log completion and process TTS sequentially for voice mode
                 if source != "voice":
                     await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": "📝 Text mode - streaming complete, skipping TTS synthesis", "websocket": ws})
+                    # For text mode, complete the metrics tracking here
+                    if response_id:
+                        metrics = metrics_collector.complete_response(response_id)
+                        if metrics:
+                            await self.app.comms_out_queue.put({
+                                "type": "log", 
+                                "level": "info", 
+                                "message": f"📊 Text Response Metrics: {metrics.get('tokens_per_second', 0):.1f} tokens/sec, {metrics.get('total_duration', 0):.2f}s total", 
+                                "websocket": ws
+                            })
                 else:
                     # Send complete response to TTS as single chunk to avoid overlapping
                     await self.app.comms_out_queue.put({"type": "log", "level": "info", "message": f"🎵 Sending complete response to TTS (sequential processing)", "websocket": ws})
                     await self.app.tts_in_queue.put({
                         "text": full_response.strip(), 
                         "websocket": ws, 
-                        "is_streaming": False
+                        "is_streaming": False,
+                        "response_id": response_id  # Pass response_id for TTS metrics
                     })
                     
             except Exception as e:
@@ -421,8 +554,14 @@ class TTSAgent(Agent):
             use_fallback = job.get("use_fallback", False)
             is_greeting = job.get("is_greeting", False)
             is_streaming = job.get("is_streaming", False)
+            response_id = job.get("response_id")  # Get response_id for metrics
+            
             try:
-                await self.app.comms_out_queue.put({"type": "status", "component": "tts", "status": "🟡 Speaking...", "websocket": ws})
+                # Mark TTS start in metrics
+                if response_id:
+                    metrics_collector.mark_tts_start(response_id)
+                
+                await self.app.comms_out_queue.put({"type": "status", "component": "tts", "status": "working", "websocket": ws})
                 
                 # Log different messages for streaming vs batch TTS
                 if is_streaming:
@@ -449,7 +588,22 @@ class TTSAgent(Agent):
                 
                 if audio_data is not None and len(audio_data) > 0:
                     duration = len(audio_data) / sample_rate
+                    
+                    # Mark TTS completion in metrics
+                    if response_id:
+                        metrics_collector.mark_tts_complete(response_id, duration)
+                        # Complete the voice response metrics tracking
+                        metrics = metrics_collector.complete_response(response_id)
+                        if metrics and not is_streaming:  # Only show full metrics for non-streaming TTS
+                            await self.app.comms_out_queue.put({
+                                "type": "log", 
+                                "level": "info", 
+                                "message": f"📊 Voice Response Metrics: {metrics.get('voice_to_voice_latency', 0):.2f}s total, STT: {metrics.get('stt_latency', 0):.2f}s, LLM: {metrics.get('llm_latency', 0):.2f}s, TTS: {metrics.get('tts_latency', 0):.2f}s", 
+                                "websocket": ws
+                            })
+                    
                     await self.app.comms_out_queue.put({"type": "log", "level": "success", "message": f"✅ TTS generated {len(audio_data)} samples ({duration:.1f}s) at {sample_rate}Hz", "websocket": ws})
+                    await self.app.comms_out_queue.put({"type": "status", "component": "tts", "status": "ready", "websocket": ws})
                     
                     # Convert to int16 and encode as base64
                     audio_b64 = base64.b64encode((audio_data * 32767).astype(np.int16).tobytes()).decode('utf-8')
@@ -538,6 +692,17 @@ class VoiceAssistant:
     async def initialize_services(self):
         logger.info("🚀 Initializing AI services with GPU optimization...")
         
+        # Start system resource monitoring
+        await metrics_collector.start_system_monitoring(interval=1.0)
+        logger.info("📊 System metrics monitoring started")
+        
+        # Start auto-export task (every 5 minutes)
+        asyncio.create_task(self._auto_export_metrics_loop())
+        logger.info("📁 Auto-export metrics task started")
+        
+        # Initialize metrics API with this app instance
+        metrics_api.app = self
+        
         # Configure multiprocessing for CUDA compatibility
         import torch.multiprocessing as mp
         try:
@@ -547,12 +712,26 @@ class VoiceAssistant:
         except RuntimeError as e:
             logger.info(f"Multiprocessing context already set: {e}")
         
-        # Initialize CUDA context properly
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            logger.info(f"✅ CUDA initialized - GPU: {torch.cuda.get_device_name(0)}")
-        else:
-            logger.warning("⚠️ CUDA not available, models will run on CPU")
+        # Initialize CUDA context properly with error handling
+        try:
+            # Force CUDA reinitialization
+            torch.cuda.is_available()  # This call initializes CUDA
+            
+            if torch.cuda.is_available():
+                # Try to get device info - this will fail if CUDA is misconfigured
+                device_count = torch.cuda.device_count()
+                if device_count > 0:
+                    gpu_name = torch.cuda.get_device_name(0)
+                    torch.cuda.empty_cache()
+                    logger.info(f"✅ CUDA initialized - GPU: {gpu_name}")
+                else:
+                    logger.warning("⚠️ No CUDA devices found")
+            else:
+                logger.warning("⚠️ CUDA not available, models will run on CPU")
+        except Exception as cuda_error:
+            logger.warning(f"⚠️ CUDA error: {cuda_error}. Falling back to CPU.")
+            # Don't change environment variables after program start - this causes CUDA errors
+            # Instead, let services handle CPU fallback internally
         
         # Initialize services sequentially to avoid CUDA conflicts
         try:
@@ -620,11 +799,45 @@ class VoiceAssistant:
             logger.warning(f"Failed to send to client {id(websocket)}: {e}")
 
     async def cleanup(self):
+        # Export final metrics before cleanup
+        try:
+            logger.info("📊 Exporting final session metrics...")
+            export_path = metrics_exporter.export_performance_summary()
+            logger.info(f"✅ Final metrics exported to: {export_path}")
+        except Exception as e:
+            logger.error(f"❌ Failed to export final metrics: {e}")
+        
+        # Stop system monitoring
+        await metrics_collector.stop_system_monitoring()
+        logger.info("📊 System metrics monitoring stopped")
+        
         for agent in self.agents: await agent.stop()
         if self.stt_service: self.stt_service.cleanup()
         if self.tts_service: self.tts_service.cleanup()
         if self.isolated_tts_service: self.isolated_tts_service.cleanup()
         if self.llm_service: await self.llm_service.cleanup()
+    
+    async def _auto_export_metrics_loop(self):
+        """Background task to auto-export metrics every 5 minutes"""
+        export_interval = 300  # 5 minutes
+        
+        while True:
+            try:
+                await asyncio.sleep(export_interval)
+                
+                # Export performance summary
+                export_path = metrics_exporter.export_performance_summary()
+                logger.info(f"📁 Auto-exported metrics to: {export_path}")
+                
+                # Clean up old files (keep 7 days)
+                metrics_exporter.cleanup_old_files(days_to_keep=7)
+                
+            except asyncio.CancelledError:
+                logger.info("📁 Auto-export task cancelled")
+                break
+            except Exception as e:
+                logger.error(f"❌ Auto-export error: {e}")
+                # Continue the loop despite errors
 
 async def main():
     log_queue = asyncio.Queue()

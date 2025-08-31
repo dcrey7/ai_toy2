@@ -13,6 +13,13 @@ class VoiceAssistant {
         
         this.audioState = 'idle'; // idle|ai_speaking|user_listening|processing
         
+        // Voice-to-voice latency timing
+        this.voiceTimingMetrics = {
+            userSpeechEnd: null,
+            aiSpeechStart: null,
+            currentResponseId: null
+        };
+        
         this.chatMessages = document.getElementById('chatMessages');
         this.chatInput = document.getElementById('chatInput');
         this.sendButton = document.getElementById('sendButton');
@@ -34,7 +41,7 @@ class VoiceAssistant {
             <div class="voice-controls-section">
                 <div class="status-indicator">
                     🎥 Live<br>
-                    <div class="status-dot" id="connectionDot"></div><span id="connectionStatus">Connecting...</span>
+                    <span id="connectionStatus">🔴 Connecting...</span>
                 </div>
                 <div class="system-status">
                     <div class="status-item">
@@ -51,7 +58,7 @@ class VoiceAssistant {
                     </div>
                     <div class="status-item">
                         GPU:<br>
-                        <span class="status-value" id="gpuStatus">🟢 Ready<br><small>RTX 3050 6GB</small></span>
+                        <span class="status-value" id="gpuStatus">⚪ CPU Only<br><small>NVIDIA RTX 3050 6GB</small></span>
                     </div>
                     <div class="status-item">
                         VAD:<br>
@@ -72,7 +79,6 @@ class VoiceAssistant {
         this.voiceModeBtn = document.getElementById('voiceModeBtn');
         this.voiceToggle = document.getElementById('voiceToggle');
         this.vadStatus = document.getElementById('vadStatus');
-        this.connectionDot = document.getElementById('connectionDot');
         this.connectionStatus = document.getElementById('connectionStatus');
         
         this.textModeBtn.addEventListener('click', () => this.switchToTextMode());
@@ -88,10 +94,10 @@ class VoiceAssistant {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsUrl = `${protocol}//${window.location.host}/ws`;
         this.socket = new WebSocket(wsUrl);
-        this.socket.onopen = () => { this.updateConnectionStatus('🟢 Connected', 'ready'); window.logger.success('🔌 WebSocket connected'); };
+        this.socket.onopen = () => { this.updateConnectionStatus('🟢 Connected'); window.logger.success('🔌 WebSocket connected'); };
         this.socket.onmessage = (event) => this.handleWebSocketMessage(event.data);
-        this.socket.onclose = () => { this.updateConnectionStatus('🔴 Disconnected', 'inactive'); setTimeout(() => this.connectWebSocket(), 3000); };
-        this.socket.onerror = () => { this.updateConnectionStatus('🔴 Error', 'inactive'); };
+        this.socket.onclose = () => { this.updateConnectionStatus('🔴 Disconnected'); setTimeout(() => this.connectWebSocket(), 3000); };
+        this.socket.onerror = () => { this.updateConnectionStatus('🔴 Error'); };
     }
     
     handleWebSocketMessage(data) {
@@ -114,7 +120,20 @@ class VoiceAssistant {
                 case 'tts_audio':
                     this.handleTTSAudio(message);
                     break;
-                case 'log': window.logger.log(message.level, message.message); break;
+                case 'log': 
+                    // Check for response ID in log messages to track timing
+                    if (message.message && message.message.includes('[Response:')) {
+                        const responseIdMatch = message.message.match(/\[Response: (.+?)\]/);
+                        if (responseIdMatch && message.message.includes('Turn complete detected')) {
+                            this.voiceTimingMetrics.userSpeechEnd = performance.now();
+                            this.voiceTimingMetrics.currentResponseId = responseIdMatch[1];
+                        }
+                    }
+                    window.logger.log(message.level, message.message); 
+                    break;
+                case 'live_metrics': this.updateLiveMetrics(message); break;
+                case 'performance_metrics': this.updatePerformanceMetrics(message); break;
+                case 'metrics_response': this.handleMetricsResponse(message); break;
                 default: window.logger.debug(JSON.stringify(message));
             }
         } catch (error) {
@@ -125,6 +144,25 @@ class VoiceAssistant {
     
     
     handleTTSAudio(message) {
+        // Mark AI speech start for voice-to-voice latency
+        if (this.voiceTimingMetrics.currentResponseId && !this.voiceTimingMetrics.aiSpeechStart) {
+            this.voiceTimingMetrics.aiSpeechStart = performance.now();
+            
+            // Calculate and send voice-to-voice latency
+            if (this.voiceTimingMetrics.userSpeechEnd) {
+                const voiceToVoiceLatency = (this.voiceTimingMetrics.aiSpeechStart - this.voiceTimingMetrics.userSpeechEnd) / 1000;
+                
+                // Send client-side timing to backend
+                this.sendVoiceTimingMetrics({
+                    responseId: this.voiceTimingMetrics.currentResponseId,
+                    voiceToVoiceLatency: voiceToVoiceLatency,
+                    timestamp: Date.now()
+                });
+                
+                window.logger.success(`🎯 Voice-to-Voice Latency: ${voiceToVoiceLatency.toFixed(3)}s [${this.voiceTimingMetrics.currentResponseId}]`);
+            }
+        }
+        
         this.playTTSAudio(message.audio, message.sample_rate);
     }
     
@@ -345,19 +383,21 @@ class VoiceAssistant {
     
     updateConnectionStatus(status, className) {
         this.connectionStatus.textContent = status;
-        this.connectionDot.className = `status-dot ${className}`;
     }
     
     updateSystemStatus(component, status, modelName = '') {
         const statusElement = document.getElementById(`${component}Status`);
-        if (!statusElement) return;
+        if (!statusElement) {
+            console.warn(`Status element not found: ${component}Status`);
+            return;
+        }
         
         let statusIcon = '🟢';
         let statusText = 'Ready';
         let fullModelName = modelName;
         
         // Set status icon based on status
-        switch (status) {
+        switch (status.toLowerCase()) {
             case 'ready':
                 statusIcon = '🟢';
                 statusText = 'Ready';
@@ -372,8 +412,20 @@ class VoiceAssistant {
                 statusText = 'Error';
                 break;
             default:
-                statusIcon = '⚪';
-                statusText = status;
+                // Handle complex status messages like "🟡 Transcribing..."
+                if (status.includes('🟡') || status.includes('Working') || status.includes('processing')) {
+                    statusIcon = '🟡';
+                    statusText = 'Working';
+                } else if (status.includes('🟢') || status.includes('Ready')) {
+                    statusIcon = '🟢';
+                    statusText = 'Ready';
+                } else if (status.includes('🔴') || status.includes('Error')) {
+                    statusIcon = '🔴';
+                    statusText = 'Error';
+                } else {
+                    statusIcon = '⚪';
+                    statusText = status;
+                }
         }
         
         // Set model names for different components
@@ -388,14 +440,15 @@ class VoiceAssistant {
                 fullModelName = fullModelName || 'Kokoro TTS';
                 break;
             case 'gpu':
-                fullModelName = fullModelName || 'NVIDIA GeForce RTX 3050 6GB Laptop GPU';
+                fullModelName = fullModelName || 'NVIDIA RTX 3050 6GB';
                 break;
             case 'vadSystem':
-                fullModelName = fullModelName || 'Smart Turn v2 VAD';
+                fullModelName = fullModelName || 'Smart Turn v2';
                 break;
         }
         
-        statusElement.innerHTML = `${statusIcon} ${statusText}${fullModelName ? '<br><small>' + fullModelName + '</small>' : ''}`;
+        statusElement.innerHTML = `${statusIcon} ${statusText}<br><small>${fullModelName}</small>`;
+        console.log(`Updated ${component} status: ${statusIcon} ${statusText} - ${fullModelName}`);
     }
 
     updateVadStatus(status) {
@@ -511,6 +564,81 @@ class VoiceAssistant {
         this.chatMessages.scrollTop = this.chatMessages.scrollHeight;
     }
     
+    sendVoiceTimingMetrics(timingData) {
+        if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+            this.socket.send(JSON.stringify({
+                type: 'voice_timing_metrics',
+                ...timingData
+            }));
+        }
+        
+        // Reset timing data for next response
+        this.voiceTimingMetrics = {
+            userSpeechEnd: null,
+            aiSpeechStart: null,
+            currentResponseId: null
+        };
+    }
+
+    updateLiveMetrics(message) {
+        // Update system resource metrics in UI
+        try {
+            const metricsHtml = `
+                <div class="metrics-row">
+                    <span>🖥️ CPU: ${message.cpu_percent?.toFixed(1)}%</span>
+                    <span>💾 RAM: ${message.ram_percent?.toFixed(1)}%</span>
+                    <span>🎮 GPU: ${message.gpu_utilization?.toFixed(1)}%</span>
+                    <span>📊 GPU Mem: ${message.gpu_memory_percent?.toFixed(1)}%</span>
+                </div>
+            `;
+            
+            // Find or create metrics display in logs
+            let metricsDisplay = document.getElementById('liveMetricsDisplay');
+            if (!metricsDisplay) {
+                metricsDisplay = document.createElement('div');
+                metricsDisplay.id = 'liveMetricsDisplay';
+                metricsDisplay.className = 'live-metrics-display';
+                metricsDisplay.innerHTML = '<div class="metrics-header">📊 Live System Metrics</div>';
+                
+                // Insert at top of logs container
+                const logsContainer = document.getElementById('logsContainer');
+                if (logsContainer) {
+                    logsContainer.insertBefore(metricsDisplay, logsContainer.firstChild);
+                }
+            }
+            
+            // Update content
+            const existingRow = metricsDisplay.querySelector('.metrics-row');
+            if (existingRow) {
+                existingRow.outerHTML = metricsHtml;
+            } else {
+                metricsDisplay.innerHTML += metricsHtml;
+            }
+            
+        } catch (error) {
+            console.error('Error updating live metrics:', error);
+        }
+    }
+    
+    updatePerformanceMetrics(message) {
+        // Display performance metrics (voice latency, tokens/sec, etc.)
+        try {
+            const data = message.data || {};
+            window.logger.info(`📈 Performance: Voice Latency: ${(data.avg_voice_latency * 1000)?.toFixed(0)}ms, Tokens/sec: ${data.avg_tokens_per_second?.toFixed(1)}`);
+        } catch (error) {
+            console.error('Error displaying performance metrics:', error);
+        }
+    }
+    
+    handleMetricsResponse(message) {
+        // Handle metrics API responses
+        console.log('Metrics response:', message.request_type, message.data);
+        
+        if (message.request_type === 'performance_summary') {
+            this.updatePerformanceMetrics(message);
+        }
+    }
+
     async initCamera() {
         try {
             const video = document.getElementById('videoFeed');

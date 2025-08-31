@@ -35,7 +35,7 @@ class SmartTurnVADService:
         self.vad_pipeline: Optional[pipeline] = None
         self.last_turn_check = 0
         self.turn_check_interval = 0.2  # Check every 200ms (faster response)
-        self.confidence_threshold = 0.3  # Lower threshold for faster detection
+        self.confidence_threshold = 0.8  # Higher threshold for more accurate detection
         
         # State tracking
         self.is_processing = False
@@ -45,7 +45,8 @@ class SmartTurnVADService:
         # Fallback mechanism
         self.speech_start_time = None
         self.max_speech_duration = max_speech_duration  # Configurable max speech duration
-        self.silence_timeout = 4.0  # Complete after 4 seconds of silence (more forgiving)
+        self.silence_timeout = 2.5  # Complete after 2.5 seconds of silence (faster response)
+        self.last_audio_time = None  # Track when we last received audio with speech
         
         self._load_model()
 
@@ -86,9 +87,11 @@ class SmartTurnVADService:
         has_speech = np.max(np.abs(audio_float)) > 0.01  # Simple activity detection
         current_time = time.time()
         
-        if has_speech and self.speech_start_time is None:
-            self.speech_start_time = current_time
-            logger.info(f"🎤 Speech started at {current_time}")
+        if has_speech:
+            if self.speech_start_time is None:
+                self.speech_start_time = current_time
+                logger.info(f"🎤 Speech started at {current_time}")
+            self.last_audio_time = current_time  # Update last audio time
         
         # Thread-safe buffer update - add to both buffers
         with self.buffer_lock:
@@ -192,6 +195,19 @@ class SmartTurnVADService:
             else:
                 # Reset consecutive counter if not complete
                 self.consecutive_complete_detections = 0
+                
+                # Fallback: Check for silence timeout
+                if self.last_audio_time and self.speech_start_time:
+                    silence_duration = current_time - self.last_audio_time
+                    speech_duration = current_time - self.speech_start_time
+                    
+                    # If we've been silent for timeout period AND had some speech
+                    if silence_duration >= self.silence_timeout and speech_duration >= 1.0:  # At least 1 second of speech
+                        logger.info(f"🔇 Silence timeout: {silence_duration:.1f}s silence after {speech_duration:.1f}s speech")
+                        self.speech_start_time = None
+                        self.last_audio_time = None
+                        return True, 0.7, "Silence timeout"
+                
                 logger.info(f"🎤 Turn in progress: {result['label']} (confidence: {confidence:.3f})")
                 return False, confidence, f"Turn {result['label']}"
             
